@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| Status | Draft. Nothing is built yet. |
+| Status | Change 1 is built, tested and archived. Changes 2 and 3 are not started. |
 | Date | 2026-11-23 |
 | Design | [durable-outbox.md](durable-outbox.md). Section numbers below refer to it. |
 
@@ -16,8 +16,7 @@ Version 1 is built as three OpenSpec changes, in order. Each one ends with a lib
 
 ## Before the first change
 
-1. Run `openspec init` in the repository root. The `openspec-*` skills are already in `.agents/skills/`, but there is no `openspec/` directory yet.
-2. Nothing else. The solution, projects and build settings arrive with change 1, their first user.
+`openspec init` has been run, so `openspec/` exists. Nothing else is needed: the solution, projects and build settings arrive with change 1, their first user.
 
 ## How each change runs
 
@@ -51,6 +50,7 @@ One test project. It has its own small `DbContext` and migration, as a service w
 | The claim statement, as an internal store the tests call directly. Claims, parks, expires and records abandoned attempts. | 9.7 |
 | The fenced outcome statements: done, retry, reject, and park when attempts or the retry window are used up. Error history capped at 20. | 9.8 |
 | SQL built once from the EF Core model's schema and table name | 9.6 |
+| `services.AddDurableOutbox<TContext>()` with no options, registering the writer only | 9.6 |
 
 **Not in this change:** handlers, the worker loop, renewal, backoff calculation, registration options, anything in change 3. The tests pass the next due time and the limits to the store directly.
 

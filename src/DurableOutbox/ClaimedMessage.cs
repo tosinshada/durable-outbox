@@ -1,0 +1,16 @@
+namespace DurableOutbox;
+
+/// <summary>One row a claim touched. <see cref="Status"/> says what the claim did with it.</summary>
+internal sealed class ClaimedMessage
+{
+    public Guid Id { get; init; }
+    public string RecordRef { get; init; } = null!;
+
+    /// <summary><c>Pending</c> when it was claimed for handling; <c>Parked</c> or <c>Expired</c> when the claim ended it.</summary>
+    public string Status { get; init; } = null!;
+
+    public int Attempt { get; init; }
+    public DateTimeOffset CreatedAt { get; init; }
+    public DateTimeOffset? Deadline { get; init; }
+    public string? TraceParent { get; init; }
+}

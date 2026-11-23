@@ -2,9 +2,9 @@
 
 | | |
 | :--- | :--- |
-| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Nothing is built or verified yet. |
+| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. The table, the writer, the claim and the fenced outcomes are built and tested against PostgreSQL. The workers and everything after them are not built. Section 9.15 has the detail. |
 | Date | 2026-11-23 |
-| Next step | Prove the claim statement against PostgreSQL, then create the repository. |
+| Next step | Build the workers: change 2 in [build-plan.md](build-plan.md). |
 
 ## 1. Summary
 
@@ -304,7 +304,7 @@ WITH due AS MATERIALIZED (
     SELECT id,
            CASE
                WHEN deadline_at <= @now THEN 'Expired'
-               WHEN attempts >= @max_attempts OR created_at <= @give_up_before THEN 'Parked'
+               WHEN attempts >= @max_attempts OR created_at <= @give_up_before THEN 'Parked'   -- "spent"
                ELSE 'Pending'
            END AS verdict,
            lease_token IS NOT NULL AS abandoned
@@ -320,14 +320,14 @@ UPDATE app.outbox_messages m
        lease_token     = CASE WHEN due.verdict = 'Pending' THEN @token END,
        next_attempt_at = CASE WHEN due.verdict = 'Pending' THEN @now + @lease ELSE m.next_attempt_at END,
        finished_at     = CASE WHEN due.verdict <> 'Pending' THEN @now END,
-       last_error      = CASE WHEN due.abandoned THEN @abandoned_error ELSE m.last_error END,
-       errors          = CASE WHEN due.abandoned
-                              THEN m.errors || jsonb_build_object('attempt', m.attempts, 'at', @now, 'error', @abandoned_error)
-                              ELSE m.errors END
+       last_error      = CASE WHEN due.abandoned THEN @error ELSE m.last_error END,
+       errors          = CASE WHEN due.abandoned THEN <errors with this attempt appended> ELSE m.errors END
   FROM due
  WHERE m.id = due.id
 RETURNING m.id, m.record_ref, m.status, m.attempts, m.created_at, m.deadline_at, m.trace_parent;
 ```
+
+`@give_up_before` is now minus the kind's retry window, or null when it has none. `@error` here is the fixed text for an attempt that never reported. The appended error history is the expression in 9.8.
 
 What the one statement does:
 
@@ -348,13 +348,38 @@ UPDATE app.outbox_messages
    SET status = 'Completed', finished_at = @now, lease_token = NULL
  WHERE id = @id AND lease_token = @token AND status = 'Pending';
 
--- Retry (or RetryAt)
+-- Failed (Retry or RetryAt). "spent" is the same test as in the claim:
+-- attempts >= @max_attempts OR created_at <= @give_up_before
 UPDATE app.outbox_messages
-   SET next_attempt_at = @next, lease_token = NULL, last_error = @error, errors = errors || @entry
+   SET status          = CASE WHEN <spent> THEN 'Parked' ELSE 'Pending' END,
+       finished_at     = CASE WHEN <spent> THEN @now END,
+       next_attempt_at = CASE WHEN <spent> THEN next_attempt_at ELSE @next END,
+       lease_token     = NULL,
+       last_error      = @error,
+       errors          = <errors with this attempt appended>
+ WHERE id = @id AND lease_token = @token AND status = 'Pending'
+RETURNING status;
+
+-- Reject
+UPDATE app.outbox_messages
+   SET status = 'Rejected', finished_at = @now, lease_token = NULL,
+       last_error = @error, errors = <errors with this attempt appended>
  WHERE id = @id AND lease_token = @token AND status = 'Pending';
 ```
 
-`Reject` and a retry with attempts or the retry window used up set `Rejected` or `Parked` in the same way. One row affected means the outcome stands. None means the lease was lost: the result is discarded, logged and counted.
+A failed attempt chooses between retry and park inside the statement, from the row's own attempt count, so the choice cannot disagree with the row. One row affected means the outcome stands. None means the lease was lost: the result is discarded, logged and counted.
+
+Every statement that records an error, the claim included, appends through the same expression, which keeps the most recent 20 entries:
+
+```sql
+(SELECT jsonb_agg(entry ORDER BY position)
+   FROM (SELECT entry, position
+           FROM jsonb_array_elements(
+                    errors || jsonb_build_object('attempt', attempts, 'at', @now, 'error', @error))
+                WITH ORDINALITY AS history(entry, position)
+          ORDER BY position DESC
+          LIMIT 20) AS recent)
+```
 
 The retry delay is `min(base × 2^(attempt − 1), cap)`, multiplied by a random factor between 0.8 and 1.2.
 
@@ -443,6 +468,7 @@ The library's own tests run against PostgreSQL in Testcontainers, with a fake `T
 - **Delivery delay.** A new message waits up to `PollInterval` (1 second by default).
 - **Repeated sends.** If renewal fails for longer than the lease, for example while the database is unreachable, another worker can take the message while the first handler is still sending.
 - **Table growth.** Finished rows stay until the service removes them. They are not in the claim index, so they do not slow claiming, but the service needs a retention job or partitioning.
+- **Idle claims.** PostgreSQL walks the claim index in priority order, so a claim that finds nothing due reads every index entry for its kind: the messages that are leased or waiting for a retry. Measured on PostgreSQL 17 with 100,000 such messages and none due, that took 0.16 ms with 3 distinct priorities and 2.2 ms with about 2,000. Finished messages are not in the index and cost nothing. A kind with millions of waiting messages will pay this on every poll.
 - **Vacuum.** Each message is updated at least twice, and those updates touch an indexed column. On a busy table, autovacuum should be set to run more often than the default.
 - **Connections.** Each kind uses up to `MaxConcurrency` connections for handlers, plus one for claiming and renewal. All kinds share the service's connection pool, so the pool must cover the sum of every kind's `MaxConcurrency`, plus one per kind, plus what the service's own requests need. A pool smaller than that lets one busy kind starve the others and the service itself.
 - **Slow work within a kind.** Kinds are isolated from each other, but messages of one kind share its slots. If a kind sends to several destinations and one is slow, that destination can hold every slot. Register a separate kind for work that must not be held up.
@@ -456,9 +482,19 @@ The library's own tests run against PostgreSQL in Testcontainers, with a fake `T
 | 3 | An attempt's trace is a child of the writer's trace, including retries that run much later. | A link would be more exact for late retries but makes the common case harder to follow. |
 | 4 | Defaults: poll 1 second, lease 60 seconds, attempt timeout 5 minutes, 10 attempts, backoff 5 seconds to 15 minutes. | Starting values, all configurable. |
 
-### 9.15 Not yet verified
+### 9.15 What is verified
 
-The SQL and API in this section are a design. None of it has been run. The claim statement in 9.7 is the part to prove first against real PostgreSQL, under several concurrent workers.
+Built and tested against PostgreSQL 17 (change `add-outbox-store`):
+
+- The table and its two indexes (9.3), created by a migration generated from the library's configuration.
+- `AddAsync` (9.4), including refusal outside a transaction and duplicate uniqueness keys.
+- The claim (9.7): four concurrent claimers take 1,000 messages exactly once. With the row lock removed from the statement, the same test hands out 1,300.
+- Recovery and parking of attempts that never report, parking by retry window, and expiry by deadline.
+- The done, failed and rejected outcomes (9.8), refused under a stale token, and the 20-entry error history.
+
+So far the registration is `services.AddDurableOutbox<AppDbContext>()` with no options, and it registers the writer only.
+
+Not built, and so still a design: handlers and options (9.5, 9.6), lease renewal (9.8), the worker loop (9.9), the operator API (9.10), telemetry, the health check and the start-up check (9.11), and the test kit (9.12). The operator index in 9.3 arrives with the operator API. Nothing has been run on PostgreSQL 14 to 16.
 
 ## 10. Sources
 

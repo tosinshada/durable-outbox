@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DurableOutbox/DurableOutbox.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DurableOutbox.Tests/DurableOutbox.Tests.csproj" />
+  </Folder>
+</Solution>

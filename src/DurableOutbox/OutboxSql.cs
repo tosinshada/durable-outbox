@@ -77,6 +77,21 @@ internal sealed class OutboxSql
                    errors = {AppendError("")}
              WHERE id = @id AND lease_token = @token AND status = 'Pending'
             """;
+
+        Renew = $"""
+            WITH held AS MATERIALIZED (
+                SELECT m.id
+                  FROM {table} m
+                  JOIN unnest(@ids, @tokens) AS h(id, token) ON m.id = h.id AND m.lease_token = h.token
+                 WHERE m.status = 'Pending'
+                   FOR UPDATE OF m SKIP LOCKED
+            )
+            UPDATE {table} m
+               SET next_attempt_at = @now + @lease
+              FROM held
+             WHERE m.id = held.id
+            RETURNING m.id AS "Value"
+            """;
     }
 
     public string Insert { get; }
@@ -84,6 +99,12 @@ internal sealed class OutboxSql
     public string Complete { get; }
     public string Fail { get; }
     public string Reject { get; }
+
+    /// <summary>
+    /// Extends the lease of every message still held under its own claim's token. Skips rows another
+    /// statement has locked; a row skipped counts as not renewed.
+    /// </summary>
+    public string Renew { get; }
 
     /// <summary>
     /// The row's error history with one entry added for its current attempt, cut to the most recent

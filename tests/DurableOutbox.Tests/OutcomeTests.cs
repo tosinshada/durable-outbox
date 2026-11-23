@@ -1,4 +1,3 @@
-using System.Text.Json;
 using Xunit;
 
 namespace DurableOutbox.Tests;
@@ -111,8 +110,4 @@ public sealed class OutcomeTests(PostgresFixture postgres) : OutboxTestBase(post
         Assert.Equal("failure 25", row.LastError);
         Assert.Equal(Enumerable.Range(6, 20).Select(attempt => (attempt, $"failure {attempt}")), Errors(row));
     }
-
-    private static (int Attempt, string Error)[] Errors(OutboxMessageRow row) =>
-        [.. JsonDocument.Parse(row.Errors).RootElement.EnumerateArray()
-            .Select(entry => (entry.GetProperty("attempt").GetInt32(), entry.GetProperty("error").GetString()!))];
 }

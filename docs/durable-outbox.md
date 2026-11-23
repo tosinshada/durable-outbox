@@ -2,9 +2,9 @@
 
 | | |
 | :--- | :--- |
-| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. The table, the writer, the claim and the fenced outcomes are built and tested against PostgreSQL. The workers and everything after them are not built. Section 9.15 has the detail. |
+| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. The table, the writer, the claim, the fenced outcomes, the handlers and the workers are built and tested against PostgreSQL. The operator API, telemetry, the start-up check and the test kit are not built. Section 9.15 has the detail. |
 | Date | 2026-11-23 |
-| Next step | Build the workers: change 2 in [build-plan.md](build-plan.md). |
+| Next step | Build the operator tools and the release: change 3 in [build-plan.md](build-plan.md). |
 
 ## 1. Summary
 
@@ -250,7 +250,7 @@ public sealed record OutboxDelivery(
     Guid Id, string Kind, string RecordRef, int Attempt,
     DateTimeOffset CreatedAt, DateTimeOffset? Deadline);
 
-public abstract record OutboxResult
+public abstract class OutboxResult      // only the library creates results
 {
     public static OutboxResult Done();
     public static OutboxResult Done(Func<CancellationToken, Task> record);
@@ -260,23 +260,25 @@ public abstract record OutboxResult
 }
 ```
 
-- Each attempt runs in its own dependency-injection scope.
-- An exception counts as `Retry`. Its text passes through the service's error filter before it is stored, and is cut to 2,000 characters.
-- The cancellation token is cancelled when the lease is lost, and at the end of the drain period on shutdown. Nothing is recorded for an attempt cancelled this way.
-- The token is also cancelled when the attempt runs longer than the kind's `AttemptTimeout`. The handler then has 5 seconds to return. After that the attempt is recorded as a retry with the error "timed out", and its slot is freed whether or not the handler has returned. A handler that ignores the token keeps running outside the concurrency limit, and its late result is refused, so handlers must honour the token.
-- `RetryAt` uses an attempt like any other retry.
-- `Done(record)` is for follow-up database writes. The library opens a transaction on the scope's `DbContext`, writes the fenced completion first, then runs `record`, saves and commits. If the completion matches no row, `record` never runs. Under a retrying execution strategy `record` can run more than once, so it must only touch the database.
+- Each attempt runs in its own dependency-injection scope, with a handler resolved from it.
+- An exception counts as `Retry`. Its stored text is the exception's type, message and stack trace.
+- Every error text (a `Retry` or `RetryAt` error, a `Reject` reason, an exception, "timed out") passes once through the service's error filter, `RedactError`, and is then cut to 2,000 characters. That one text is what is stored and what is logged. If the filter throws, the library stores and logs "The error text could not be redacted." instead, never the original.
+- The cancellation token is cancelled when the lease is lost (9.8), and at the end of the drain period on shutdown (9.9). Nothing is recorded for a lost lease, whatever the handler returns. After the drain period, a result the handler still returns is recorded; an exception is not.
+- The token is also cancelled when the attempt runs longer than the kind's `AttemptTimeout`. The handler then has 5 seconds to return. A result it returns in that time is recorded. If it throws, or has not returned, the attempt is recorded as a retry with the error "timed out", and its slot is freed whether or not the handler has returned. That retry is written in a new scope, because the handler may still be using its own `DbContext`. A handler that ignores the token keeps running outside the concurrency limit, keeps its scope until it ends, and its late result is discarded, so handlers must honour the token.
+- `RetryAt` uses an attempt like any other retry. A time in the past makes the message due at once.
+- `Done(record)` is for follow-up database writes. After the handler returns, the library opens a transaction on the scope's `DbContext`, writes the fenced completion first, then runs `record` with the attempt's token, saves and commits. If the completion matches no row, `record` never runs. If `record`, the save or the commit throws, the transaction rolls back and the attempt is recorded as a failed one with that exception. Under a retrying execution strategy `record` can run more than once, so it must only touch the database. Changes the handler left tracked in the scope's `DbContext` are saved with `record`'s.
 
 ### 9.6 Registration
 
 ```csharp
-services.AddDurableOutbox<AppDbContext>(outbox =>
+services.AddDurableOutbox<AppDbContext>(outbox =>      // OutboxOptions; the callback is optional
 {
     outbox.PollInterval = TimeSpan.FromSeconds(1);
-    outbox.RedactError = error => error;          // the service's filter for stored error text
+    outbox.RedactError = error => error;          // the service's filter for stored and logged error text
     outbox.RunWorkers = true;                     // false in a process that only writes
+    outbox.DrainTimeout = TimeSpan.FromSeconds(20);
 
-    outbox.AddHandler<SendReceiptHandler>("receipt.send", kind =>
+    outbox.AddHandler<SendReceiptHandler>("receipt.send", kind =>   // OutboxKindOptions; optional
     {
         kind.Lease = TimeSpan.FromSeconds(60);
         kind.MaxConcurrency = 8;
@@ -293,7 +295,11 @@ protected override void OnModelCreating(ModelBuilder modelBuilder) =>
     modelBuilder.AddDurableOutbox(schema: "app", table: "outbox_messages");
 ```
 
-Options are validated at start-up. The schema and table name are read from the EF Core model, so the SQL is built once and always matches the migration.
+The values above are the defaults. Options are checked when the registration call runs: an invalid one (an empty or repeated kind, a lease, poll interval, backoff base, attempt timeout or retry window that is not positive, a backoff cap below the base, a concurrency or attempt limit below 1, a negative drain timeout, no error filter) throws `ArgumentException` naming the kind and the option. The library keeps a copy, so changing the options object afterwards has no effect.
+
+Each handler type is registered as scoped. The workers start with the host when `RunWorkers` is true and at least one handler is registered; otherwise the registration provides the writer only. A process claims only the kinds it has a handler for: messages of any other kind wait untouched.
+
+The schema and table name are read from the EF Core model, so the SQL is built once and always matches the migration.
 
 ### 9.7 Claiming
 
@@ -381,18 +387,33 @@ Every statement that records an error, the claim included, appends through the s
           LIMIT 20) AS recent)
 ```
 
-The retry delay is `min(base × 2^(attempt − 1), cap)`, multiplied by a random factor between 0.8 and 1.2.
+The retry delay is `min(base × 2^(attempt − 1), cap)`, multiplied by a random factor between 0.8 and 1.2, counted from the time the failure is written. `RetryAt` gives the due time instead.
 
-Renewal runs per kind every third of the lease and extends every message in flight in one statement:
+Renewal runs per kind every third of the lease and extends every attempt whose handler is still running, in one statement. Each claim has its own token, so the running attempts of a kind carry many tokens, and each message is fenced by the token of the claim that holds it. The statement takes the IDs and tokens as two arrays of pairs:
 
 ```sql
-UPDATE app.outbox_messages
+WITH held AS MATERIALIZED (
+    SELECT m.id
+      FROM app.outbox_messages m
+      JOIN unnest(@ids, @tokens) AS h(id, token) ON m.id = h.id AND m.lease_token = h.token
+     WHERE m.status = 'Pending'
+       FOR UPDATE OF m SKIP LOCKED
+)
+UPDATE app.outbox_messages m
    SET next_attempt_at = @now + @lease
- WHERE id = ANY(@ids) AND lease_token = @token AND status = 'Pending'
-RETURNING id;
+  FROM held
+ WHERE m.id = held.id
+RETURNING m.id;
 ```
 
-A message missing from the result has lost its lease, and its handler's token is cancelled.
+The primary key serves it. `SKIP LOCKED` keeps a renewal from waiting on a row that another statement holds, such as a claimer taking the message over; a row skipped counts as not renewed. An attempt leaves the renewal set the moment its handler returns, before its outcome is written, so a renewal never meets its own completion.
+
+An attempt has lost its lease, and its handler's token is cancelled, when:
+
+- a renewal reached the database and did not return its ID, or
+- its lease end (the claim time or the last successful renewal, plus the lease) has passed without a renewal that reached the database. This stops a handler during an outage instead of leaving it to send while another instance may take the message over.
+
+Nothing is recorded for an attempt that lost its lease.
 
 ### 9.9 Worker loop
 
@@ -400,13 +421,17 @@ For each kind:
 
 1. Wait until at least one concurrency slot is free.
 2. Claim up to that many messages.
-3. Start each on its own task and scope. On finish, write the outcome and free the slot.
-4. If the claim filled every free slot, go again as soon as a slot frees. Otherwise wait `PollInterval`, with jitter.
-5. If the database is unreachable, log, and wait with a backoff of up to 30 seconds. Nothing is lost: claims expire on their own.
+3. Start each on its own task and scope. On finish, write the outcome with no cancellation token and free the slot.
+4. If the claim returned as many messages as it asked for, go again as soon as a slot frees. Otherwise wait `PollInterval`, multiplied by a random factor between 0.8 and 1.2. Messages the claim parked or expired count towards what it returned; they are logged, never handled, and use no slot.
+5. If a claim fails because the database is unreachable or returns an error, log it and wait: `PollInterval` after the first failure, doubling after each one in a row, up to 30 seconds. The first claim that succeeds returns the loop to normal polling. Nothing is lost: claims expire on their own.
 
-Because each kind has its own loop and its own limit, a slow kind cannot hold up another.
+The loop also runs the renewal (9.8). Claim and renewal are statements of the loop itself, one at a time, each in a short scope of its own, so a kind uses one connection for them besides its handlers. An outcome write that fails is logged and not retried; the message comes back after its lease as an abandoned attempt.
 
-On shutdown the loop stops claiming and waits for running handlers. After `DrainTimeout` (default 20 seconds, inside the host's 30) their tokens are cancelled. Anything still unfinished is recovered by lease expiry.
+Because each kind has its own loop and its own limit, a slow kind cannot hold up another. The workers run as one hosted service per `DbContext` type, with one loop per registered kind.
+
+On shutdown the loop stops claiming at once and keeps renewing. It waits up to `DrainTimeout` (default 20 seconds, inside the host's 30) for running handlers, then cancels their tokens and keeps waiting for them and their outcomes until the host's own shutdown time ends. An outcome a handler returned is always recorded. Anything still unfinished is recovered by lease expiry.
+
+The loop writes source-generated log messages when the database cannot be reached, when a lease is lost, when a handler throws, when an attempt times out, when the claim parks or expires a message, and when an outcome is refused or cannot be written. Each carries the message ID, kind and attempt where they exist. Error text in them has passed through `RedactError`.
 
 All times come from `TimeProvider`. A lease must be much longer than the clock difference between instances. A clock difference can cause an early takeover and so a repeated send, which at-least-once already allows; the token still prevents a wrong write.
 
@@ -441,7 +466,7 @@ The three gauges come from one grouped query over the partial indexes, run every
 
 Tracing uses the activity source `DurableOutbox`. `AddAsync` stores the current trace context on the row. Each attempt starts a consumer activity `outbox.handle {kind}` with that context as its parent, so a trace runs from the request to the delivery.
 
-Logs use source-generated messages with the message ID, kind and attempt. The record reference is logged; error text is logged only after the service's filter.
+Logs use source-generated messages with the message ID, kind and attempt, under the category `DurableOutbox`. They arrive with the workers (9.9). The record reference is logged; error text is logged only after the service's filter.
 
 The health check reports `Degraded` when the oldest due message of any kind is older than a threshold the service sets. It reads the sampled gauge and runs no query of its own. It never reports `Unhealthy`: a backlog is not fixed by restarting the process.
 
@@ -465,8 +490,8 @@ The library's own tests run against PostgreSQL in Testcontainers, with a fake `T
 
 ### 9.13 Operating notes and known limits
 
-- **Delivery delay.** A new message waits up to `PollInterval` (1 second by default).
-- **Repeated sends.** If renewal fails for longer than the lease, for example while the database is unreachable, another worker can take the message while the first handler is still sending.
+- **Delivery delay.** A new message waits up to 1.2 times `PollInterval` (1 second by default): the poll with its jitter.
+- **Repeated sends.** If renewal fails for longer than the lease, for example while the database is unreachable, another worker can take the message. The first handler's token is cancelled when its lease end passes, but a handler that does not stop promptly can still be sending.
 - **Table growth.** Finished rows stay until the service removes them. They are not in the claim index, so they do not slow claiming, but the service needs a retention job or partitioning.
 - **Idle claims.** PostgreSQL walks the claim index in priority order, so a claim that finds nothing due reads every index entry for its kind: the messages that are leased or waiting for a retry. Measured on PostgreSQL 17 with 100,000 such messages and none due, that took 0.16 ms with 3 distinct priorities and 2.2 ms with about 2,000. Finished messages are not in the index and cost nothing. A kind with millions of waiting messages will pay this on every poll.
 - **Vacuum.** Each message is updated at least twice, and those updates touch an indexed column. On a busy table, autovacuum should be set to run more often than the default.
@@ -480,7 +505,11 @@ The library's own tests run against PostgreSQL in Testcontainers, with a fake `T
 | 1 | `AddAsync` needs an explicit transaction and inserts at once. The implicit transaction of a lone `SaveChanges` is not enough. | It is what makes "duplicate ignored" and "refused outside a transaction" possible. |
 | 2 | Column names are fixed by the library. Only the schema and table name are the service's choice. | It keeps the SQL constant and the start-up check simple. |
 | 3 | An attempt's trace is a child of the writer's trace, including retries that run much later. | A link would be more exact for late retries but makes the common case harder to follow. |
-| 4 | Defaults: poll 1 second, lease 60 seconds, attempt timeout 5 minutes, 10 attempts, backoff 5 seconds to 15 minutes. | Starting values, all configurable. |
+| 4 | Defaults: poll 1 second, lease 60 seconds, 8 concurrent attempts per kind, attempt timeout 5 minutes, 10 attempts, backoff 5 seconds to 15 minutes, drain 20 seconds. | Starting values, all configurable. |
+| 5 | Renewal fences each message on the token of the claim that holds it, sent as pairs in one statement. | One token per claim is what refuses a late result when the same worker claims a message again. One statement per renewal keeps queries out of loops. |
+| 6 | A handler's token is also cancelled when its lease end passes without a renewal that reached the database. | During an outage another instance can take the message. Stopping the first handler costs one attempt, which is cheaper than a repeated send. |
+| 7 | Options are checked when the registration call runs, and copied. | It fails in the line that is wrong, before the host starts, and a later change to the options object cannot change a running worker. |
+| 8 | The workers' log messages arrive with the workers, not with the rest of the telemetry. | The loop's failures (an unreachable database, a lost lease) would otherwise be silent until the metrics exist. |
 
 ### 9.15 What is verified
 
@@ -492,9 +521,14 @@ Built and tested against PostgreSQL 17 (change `add-outbox-store`):
 - Recovery and parking of attempts that never report, parking by retry window, and expiry by deadline.
 - The done, failed and rejected outcomes (9.8), refused under a stale token, and the 20-entry error history.
 
-So far the registration is `services.AddDurableOutbox<AppDbContext>()` with no options, and it registers the writer only.
+Built and tested against PostgreSQL 17 (change `add-outbox-workers`), with the real workers driven by a fake clock:
 
-Not built, and so still a design: handlers and options (9.5, 9.6), lease renewal (9.8), the worker loop (9.9), the operator API (9.10), telemetry, the health check and the start-up check (9.11), and the test kit (9.12). The operator index in 9.3 arrives with the operator API. Nothing has been run on PostgreSQL 14 to 16.
+- Handlers, results and registration (9.5, 9.6), with invalid options refused.
+- The worker loop (9.9): a message attempted until done with the same ID, the concurrency limit, isolation between kinds, a message expired by the claim never handled, recovery after the database refused connections, and both outcomes of the drain on shutdown.
+- Lease renewal (9.8): a renewed lease is not taken over across two claims, and a handler whose lease is lost, or whose lease ran out during an outage, is cancelled with nothing recorded. With renewal removed from the loop, three of these tests fail.
+- The attempt timeout, including a handler that ignores its token; the backoff range; `RetryAt`; `Done(record)` in all three outcomes; and error text redacted and cut before it is stored or logged.
+
+Not built, and so still a design: the operator API (9.10), metrics, tracing, the health check and the start-up check (9.11), and the test kit (9.12). The operator index in 9.3 arrives with the operator API. Nothing has been run on PostgreSQL 14 to 16.
 
 ## 10. Sources
 

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Time.Testing;
@@ -20,20 +21,22 @@ public abstract class OutboxTestBase(PostgresFixture postgres) : IAsyncLifetime
 
     protected static CancellationToken Ct => TestContext.Current.CancellationToken;
 
+    protected string ConnectionString { get; private set; } = null!;
+
     public async ValueTask InitializeAsync()
     {
-        var connectionString = await postgres.CreateDatabaseAsync(Ct);
+        ConnectionString = await postgres.CreateDatabaseAsync(Ct);
 
         _services = new ServiceCollection()
             .AddSingleton<TimeProvider>(Time)
-            .AddDbContext<TestDbContext>(options => options.UseNpgsql(connectionString))
+            .AddDbContext<TestDbContext>(options => options.UseNpgsql(ConnectionString))
             .AddDurableOutbox<TestDbContext>()
             .BuildServiceProvider();
 
         await InScopeAsync(scope => scope.GetRequiredService<TestDbContext>().Database.MigrateAsync(Ct));
     }
 
-    public async ValueTask DisposeAsync() => await _services.DisposeAsync();
+    public virtual async ValueTask DisposeAsync() => await _services.DisposeAsync();
 
     protected async Task InScopeAsync(Func<IServiceProvider, Task> work)
     {
@@ -90,6 +93,30 @@ public abstract class OutboxTestBase(PostgresFixture postgres) : IAsyncLifetime
         scope.GetRequiredService<TestDbContext>().Set<OutboxMessageRow>().AsNoTracking().ToListAsync(Ct));
 
     private protected async Task<OutboxMessageRow> RowAsync() => Assert.Single(await RowsAsync());
+
+    private protected async Task<OutboxMessageRow> RowAsync(string recordRef) =>
+        Assert.Single(await RowsAsync(), row => row.RecordRef == recordRef);
+
+    private protected Task<List<Guid>> RenewAsync(Guid[] ids, Guid[] tokens) =>
+        InScopeAsync(scope => Store(scope).RenewAsync(ids, tokens, Lease, Ct));
+
+    /// <summary>Replaces a message's lease token, as a takeover by another claim would, and returns the new one.</summary>
+    protected async Task<Guid> ReplaceTokenAsync(Guid id)
+    {
+        var token = Guid.NewGuid();
+        await InScopeAsync(scope => scope.GetRequiredService<TestDbContext>().Database.ExecuteSqlRawAsync(
+            "UPDATE svc.outbox SET lease_token = {0} WHERE id = {1}", [token, id], Ct));
+        return token;
+    }
+
+    /// <summary>Gives a message earlier attempts, so a test can start from a later one.</summary>
+    protected Task SeedAttemptsAsync(string recordRef, int attempts) =>
+        InScopeAsync(scope => scope.GetRequiredService<TestDbContext>().Database.ExecuteSqlRawAsync(
+            "UPDATE svc.outbox SET attempts = {0} WHERE record_ref = {1}", [attempts, recordRef], Ct));
+
+    private protected static (int Attempt, string Error)[] Errors(OutboxMessageRow row) =>
+        [.. JsonDocument.Parse(row.Errors).RootElement.EnumerateArray()
+            .Select(entry => (entry.GetProperty("attempt").GetInt32(), entry.GetProperty("error").GetString()!))];
 
     private static OutboxStore<TestDbContext> Store(IServiceProvider scope) =>
         scope.GetRequiredService<OutboxStore<TestDbContext>>();

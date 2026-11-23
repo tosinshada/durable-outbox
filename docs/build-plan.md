@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| Status | Change 1 is built, tested and archived. Changes 2 and 3 are not started. |
+| Status | Changes 1 and 2 are built, tested and archived. Change 3 is not started. |
 | Date | 2026-11-23 |
 | Design | [durable-outbox.md](durable-outbox.md). Section numbers below refer to it. |
 
@@ -82,6 +82,7 @@ If the claim statement needs to change to pass, section 9.7 is corrected in this
 | Backoff with jitter and a cap. An exception counts as a retry. `RedactError` and the 2,000-character cut. | 9.5, 9.8 |
 | `Done(record)`: follow-up writes that commit with the completion | 9.5 |
 | Shutdown: stop claiming, drain within `DrainTimeout`, always record an outcome that was reached | 9.9 |
+| Source-generated log messages for the events the loop handles, moved here from change 3 | 9.9, 9.14 decision 8 |
 
 **Not in this change:** operator API, metrics, tracing, health check, start-up schema check, the test kit.
 
@@ -105,7 +106,7 @@ If the claim statement needs to change to pass, section 9.7 is corrected in this
 | In scope | Design |
 | :--- | :--- |
 | `IOutboxAdmin`: list, retry, cancel. The `(kind, finished_at)` index arrives here, with its first query. | 9.10, 9.3 |
-| The `DurableOutbox` meter, the three sampled gauges, the consumer activity per attempt, source-generated logs | 9.11 |
+| The `DurableOutbox` meter, the three sampled gauges, the consumer activity per attempt. The log messages arrived with change 2. | 9.11 |
 | The health check: `Degraded` when the oldest due message is too old, never `Unhealthy` | 9.11 |
 | The start-up check that the table's columns and indexes match | 9.11 |
 | `DurableOutbox.Testing`: the guarantee tests as plain methods, and `RunUntilIdleAsync`. The guarantee tests from changes 1 and 2 move into the kit and the library's own test project calls them, so there is one copy. | 9.12 |

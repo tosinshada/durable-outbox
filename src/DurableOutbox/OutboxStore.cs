@@ -82,6 +82,20 @@ internal sealed class OutboxStore<TContext>(TContext context, OutboxSqlProvider<
         return updated == 1;
     }
 
+    /// <summary>
+    /// Extends the lease of each message whose token is still the one given for it, and returns the IDs
+    /// it extended. <paramref name="ids"/> and <paramref name="tokens"/> are pairs.
+    /// </summary>
+    public async Task<List<Guid>> RenewAsync(Guid[] ids, Guid[] tokens, TimeSpan lease, CancellationToken cancellationToken) =>
+        await context.Database
+            .SqlQueryRaw<Guid>(
+                sql.Get(context).Renew,
+                new NpgsqlParameter("ids", NpgsqlDbType.Array | NpgsqlDbType.Uuid) { Value = ids },
+                new NpgsqlParameter("tokens", NpgsqlDbType.Array | NpgsqlDbType.Uuid) { Value = tokens },
+                new NpgsqlParameter("lease", NpgsqlDbType.Interval) { Value = lease },
+                Now(time.GetUtcNow()))
+            .ToListAsync(cancellationToken);
+
     private static NpgsqlParameter Id(Guid id) => new("id", NpgsqlDbType.Uuid) { Value = id };
 
     private static NpgsqlParameter Token(Guid token) => new("token", NpgsqlDbType.Uuid) { Value = token };

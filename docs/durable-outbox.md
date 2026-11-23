@@ -2,9 +2,9 @@
 
 | | |
 | :--- | :--- |
-| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. The table, the writer, the claim, the fenced outcomes, the handlers and the workers are built and tested against PostgreSQL. The operator API, telemetry, the start-up check and the test kit are not built. Section 9.15 has the detail. |
+| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Both packages build with `dotnet pack`. Nothing is published. Section 9.15 has the detail. |
 | Date | 2026-11-23 |
-| Next step | Build the operator tools and the release: change 3 in [build-plan.md](build-plan.md). |
+| Next step | Push the repository, let the pipeline run once, and publish 1.0.0 with the owner's approval (the release steps in the README). |
 
 ## 1. Summary
 
@@ -156,7 +156,7 @@ Code and SQL here show the intended shape; names can still change during impleme
 | Package | Contents | Depends on |
 | :--- | :--- | :--- |
 | `DurableOutbox` | Writer, workers, EF Core configuration, operator API, telemetry, health check | `Npgsql.EntityFrameworkCore.PostgreSQL`, `Microsoft.Extensions.Hosting.Abstractions`, `Microsoft.Extensions.Diagnostics.HealthChecks` |
-| `DurableOutbox.Testing` | The contract tests and a drain helper for a service's own tests | `DurableOutbox` |
+| `DurableOutbox.Testing` | The contract tests and a drain helper for a service's own tests | `DurableOutbox` (the exact same version, because the kit uses its internals), `Microsoft.Extensions.TimeProvider.Testing` (the clock the contract tests move) |
 
 Both target `net10.0` only. PostgreSQL 14 or later.
 
@@ -194,11 +194,11 @@ The service creates this through its own migrations, from the EF Core configurat
 
 Indexes:
 
-| Index | Purpose |
-| :--- | :--- |
-| `(kind, priority DESC, next_attempt_at) WHERE status = 'Pending'` | The claim. Holds only unfinished messages, in claim order. |
-| `UNIQUE (kind, unique_key) WHERE unique_key IS NOT NULL` | Uniqueness. |
-| `(kind, finished_at) WHERE status IN ('Parked', 'Rejected')` | Operator lists and the parked gauge. |
+| Index | Name | Purpose |
+| :--- | :--- | :--- |
+| `(kind, priority DESC, next_attempt_at) WHERE status = 'Pending'` | `ix_{table}_claim` | The claim, the pending gauge and the oldest due age. Holds only unfinished messages, in claim order. |
+| `UNIQUE (kind, unique_key) WHERE unique_key IS NOT NULL` | `ux_{table}_unique_key` | Uniqueness. |
+| `(kind, finished_at) WHERE status IN ('Parked', 'Rejected')` | `ix_{table}_finished` | Operator lists and the parked gauge. |
 
 Status changes:
 
@@ -297,7 +297,7 @@ protected override void OnModelCreating(ModelBuilder modelBuilder) =>
 
 The values above are the defaults. Options are checked when the registration call runs: an invalid one (an empty or repeated kind, a lease, poll interval, backoff base, attempt timeout or retry window that is not positive, a backoff cap below the base, a concurrency or attempt limit below 1, a negative drain timeout, no error filter) throws `ArgumentException` naming the kind and the option. The library keeps a copy, so changing the options object afterwards has no effect.
 
-Each handler type is registered as scoped. The workers start with the host when `RunWorkers` is true and at least one handler is registered; otherwise the registration provides the writer only. A process claims only the kinds it has a handler for: messages of any other kind wait untouched.
+Each handler type is registered as scoped, whatever `RunWorkers` says, so a test can run them on demand (9.12). The workers start with the host when `RunWorkers` is true and at least one handler is registered; otherwise the host claims nothing. The registration always provides the writer, the operator API (9.10) and the start-up check (9.11). A process claims only the kinds it has a handler for: messages of any other kind wait untouched.
 
 The schema and table name are read from the EF Core model, so the SQL is built once and always matches the migration.
 
@@ -310,7 +310,8 @@ WITH due AS MATERIALIZED (
     SELECT id,
            CASE
                WHEN deadline_at <= @now THEN 'Expired'
-               WHEN attempts >= @max_attempts OR created_at <= @give_up_before THEN 'Parked'   -- "spent"
+               WHEN attempts >= @max_attempts
+                 OR (attempts > 0 AND created_at <= @give_up_before) THEN 'Parked'   -- "spent"
                ELSE 'Pending'
            END AS verdict,
            lease_token IS NOT NULL AS abandoned
@@ -330,10 +331,12 @@ UPDATE app.outbox_messages m
        errors          = CASE WHEN due.abandoned THEN <errors with this attempt appended> ELSE m.errors END
   FROM due
  WHERE m.id = due.id
-RETURNING m.id, m.record_ref, m.status, m.attempts, m.created_at, m.deadline_at, m.trace_parent;
+RETURNING m.id, m.record_ref, m.status, m.attempts, m.created_at, m.deadline_at, m.trace_parent, due.abandoned;
 ```
 
-`@give_up_before` is now minus the kind's retry window, or null when it has none. `@error` here is the fixed text for an attempt that never reported. The appended error history is the expression in 9.8.
+`@give_up_before` is now minus the kind's retry window, or null when it has none. `@error` here is the fixed text for an attempt that never reported. The appended error history is the expression in 9.8. `abandoned` is returned so the attempt that never reported can be counted (9.11).
+
+The retry window applies only to a message that has been attempted. A message with no attempts, whether new or reset by an operator retry (9.10), is claimed rather than parked, so an operator retry always gets at least one attempt. Guarantee 4 is unaffected: an attempt is counted when it is claimed, so a crashed one has already been counted.
 
 What the one statement does:
 
@@ -355,7 +358,7 @@ UPDATE app.outbox_messages
  WHERE id = @id AND lease_token = @token AND status = 'Pending';
 
 -- Failed (Retry or RetryAt). "spent" is the same test as in the claim:
--- attempts >= @max_attempts OR created_at <= @give_up_before
+-- attempts >= @max_attempts OR (attempts > 0 AND created_at <= @give_up_before)
 UPDATE app.outbox_messages
    SET status          = CASE WHEN <spent> THEN 'Parked' ELSE 'Pending' END,
        finished_at     = CASE WHEN <spent> THEN @now END,
@@ -444,9 +447,58 @@ public interface IOutboxAdmin
     Task<bool> RetryAsync(Guid id, CancellationToken cancellationToken);   // Parked or Rejected → Pending, attempts reset, errors kept
     Task<bool> CancelAsync(Guid id, CancellationToken cancellationToken);  // Pending or Parked → Cancelled
 }
+
+public enum OutboxMessageStatus { Pending, Completed, Rejected, Parked, Expired, Cancelled }
+
+public sealed record OutboxQuery(OutboxMessageStatus Status)   // Parked or Rejected
+{
+    public string? Kind { get; init; }
+    public int Limit { get; init; } = 50;                      // 1 to 1,000
+    public OutboxMessageInfo? After { get; init; }             // the last entry of the previous page
+}
+
+public sealed record OutboxMessageInfo(
+    Guid Id, string Kind, string RecordRef, string? UniqueKey, int Priority,
+    OutboxMessageStatus Status, int Attempts, DateTimeOffset CreatedAt, DateTimeOffset? Deadline,
+    DateTimeOffset? FinishedAt, string? LastError, IReadOnlyList<OutboxAttemptError> Errors);
+
+public sealed record OutboxAttemptError(int Attempt, DateTimeOffset At, string Error);
 ```
 
-`ListAsync` filters by status and kind and pages by `(finished_at, id)`. Cancelling a message that is mid-attempt clears its token, so that attempt's outcome is refused. The library adds no endpoints; the service decides who may call these.
+`IOutboxAdmin` is registered as scoped by `AddDurableOutbox<TContext>`, on the same `DbContext`.
+
+`ListAsync` lists the messages an operator acts on: `Parked` or `Rejected`, optionally of one kind, newest finished first. It pages by `(finished_at, id)`: pass the last entry of one page as `After` to get the next, and no message is skipped or repeated. Any other status, a limit outside 1 to 1,000, or an `After` with no finish time throws `ArgumentException`. The status is written into the SQL text, not passed as a parameter, so PostgreSQL can use the partial index for it:
+
+```sql
+SELECT id, kind, record_ref, unique_key, priority, status, attempts,
+       created_at, deadline_at, finished_at, last_error, errors
+  FROM app.outbox_messages
+ WHERE status = 'Parked'                                   -- or 'Rejected'
+   [AND kind = @kind]
+   [AND (finished_at, id) < (@after_finished_at, @after_id)]
+ ORDER BY finished_at DESC, id DESC
+ LIMIT @limit;
+```
+
+With a kind, the operator index is read in order. Without one, every parked (or rejected) entry is read and sorted, which is cheap while that set is small.
+
+Retry and cancel are one statement each, by primary key. Each returns whether the message was in a status it applies to:
+
+```sql
+-- Retry
+UPDATE app.outbox_messages
+   SET status = 'Pending', attempts = 0, next_attempt_at = @now, lease_token = NULL, finished_at = NULL
+ WHERE id = @id AND status IN ('Parked', 'Rejected');
+
+-- Cancel
+UPDATE app.outbox_messages
+   SET status = 'Cancelled', finished_at = @now, lease_token = NULL
+ WHERE id = @id AND status IN ('Pending', 'Parked');
+```
+
+A retried message is due at once, its attempt limit starts again, and its error history is kept. A retried message whose deadline has passed is expired by the next claim.
+
+Cancelling a message that is mid-attempt clears its token, so that attempt's outcome is refused (guarantee 3). The next renewal finds no row under the attempt's token, so the worker treats the lease as lost and cancels the handler's token, at most a third of the lease later. The library adds no endpoints; the service decides who may call these.
 
 ### 9.11 Telemetry and health
 
@@ -462,15 +514,38 @@ Meter `DurableOutbox`:
 | `durable_outbox.messages.parked` | Gauge | `kind` |
 | `durable_outbox.oldest_due.age` | Gauge, seconds | `kind` |
 
-The three gauges come from one grouped query over the partial indexes, run every 15 seconds by default.
+The meter comes from the container's `IMeterFactory` when it has one, as a generic host does; otherwise the library creates its own.
 
-Tracing uses the activity source `DurableOutbox`. `AddAsync` stores the current trace context on the row. Each attempt starts a consumer activity `outbox.handle {kind}` with that context as its parent, so a trace runs from the request to the delivery.
+`messages.enqueued` counts each message `AddAsync` inserts, when it inserts it. A duplicate is not counted, but a message whose transaction later rolls back is: counting at commit would need a hook into the caller's transaction. `messages.expired` counts each message a claim expires.
+
+`attempts` is counted by the worker that ran the attempt, once, by how it ended: `completed` when its completion stood; `retry` when its failure was recorded and the message is due again; `timed_out` when it ran past its timeout and was recorded as a retry that left attempts; `rejected` when its rejection stood; `parked` when its failure left no attempts; `lease_lost` when its lease was lost or its outcome refused. An attempt left with no outcome for another reason (the outcome could not be written, or the handler threw after the drain period) is not counted by its worker. A claim that finds an attempt that never reported counts it `abandoned`. So an attempt whose lease ran out while its worker was alive is counted twice: `lease_lost` by its worker and `abandoned` by the claim that took the message over. `attempt.duration` is recorded with each attempt the worker counts, from the start of the handler to the outcome being written, or to the handler's return when nothing was recorded.
+
+The three gauges come from one statement, run every 15 seconds in each process that runs workers or registers the health check:
+
+```sql
+SELECT kind, count(*) AS pending, 0::bigint AS parked,
+       min(next_attempt_at) FILTER (WHERE next_attempt_at <= @now) AS oldest_due
+  FROM app.outbox_messages WHERE status = 'Pending' GROUP BY kind
+UNION ALL
+SELECT kind, 0, count(*), NULL
+  FROM app.outbox_messages WHERE status = 'Parked' GROUP BY kind;
+```
+
+Each half is served by one partial index. Every kind in the table is reported, whether or not the process has a handler for it. `oldest_due.age` is the time since the earliest due pending message became due, or zero when none is due; a message under a live claim is not due, because its due time is its lease end. Reading a gauge returns the last sample and never queries. The interval is fixed. A process with two outbox tables that share a kind reports two series with the same tags.
+
+Tracing uses the activity source `DurableOutbox`. `AddAsync` stores the current trace context on the row. Each attempt starts a consumer activity `outbox.handle {kind}` with that context as its parent, or a new trace when there is none, so a trace runs from the request to the delivery. The activity is current while the handler runs, so the handler's own calls join the trace. Its tags follow the OpenTelemetry messaging conventions where they fit: `messaging.system` (`durable_outbox`), `messaging.operation.type` (`process`), `messaging.destination.name` (the kind) and `messaging.message.id`, plus `durable_outbox.attempt` and `durable_outbox.outcome`. It is marked as an error when the attempt did not complete.
 
 Logs use source-generated messages with the message ID, kind and attempt, under the category `DurableOutbox`. They arrive with the workers (9.9). The record reference is logged; error text is logged only after the service's filter.
 
-The health check reports `Degraded` when the oldest due message of any kind is older than a threshold the service sets. It reads the sampled gauge and runs no query of its own. It never reports `Unhealthy`: a backlog is not fixed by restarting the process.
+The health check is registered on the service's health checks:
 
-At start-up the library compares the table's columns and indexes with what it expects and fails fast on a mismatch.
+```csharp
+services.AddHealthChecks().AddDurableOutbox<AppDbContext>(degradedAfter: TimeSpan.FromMinutes(5));
+```
+
+It reports `Degraded`, naming the kinds, when the last sample shows a kind whose oldest due message has waited longer than `degradedAfter`, and `Degraded` when the last sample could not be taken. Otherwise, and before the first sample, it reports `Healthy`. It reads the sample and runs no query of its own. It never reports `Unhealthy`: a backlog is not fixed by restarting the process.
+
+When the host starts, the library compares the table's columns and indexes with what it expects, in a hosted service that every `AddDurableOutbox` call registers. It reads the database catalog only. Every column of 9.3 must exist with its type and nullability, and each index of 9.3 must exist with the same columns, direction, uniqueness and filter, matched by shape rather than by name. Extra columns and indexes are allowed. On a mismatch it logs every difference and fails with an `InvalidOperationException` listing them, which stops the host under the default `BackgroundServiceExceptionBehavior.StopHost`. When the database cannot be reached, it logs that and tries again with the same backoff as the worker loop (9.9). The workers claim nothing until the check has passed.
 
 ### 9.12 Testing
 
@@ -486,7 +561,34 @@ The library's own tests run against PostgreSQL in Testcontainers, with a fake `T
 | Slow work | An attempt past its timeout is cancelled, recorded as a retry and its slot freed, including when the handler ignores the token. A kind with every slot held does not delay another kind. |
 | Other | Priority order, deadline expiry, backoff timing, `Done(record)` committing with the completion and rolling back when the lease is lost, drain on shutdown, recovery after the database restarts. |
 
-`DurableOutbox.Testing` publishes the guarantee tests as methods a service calls against its own `DbContext` and schema, with no dependency on a test framework. It also has `RunUntilIdleAsync`, which runs the workers until nothing is due, for a service's integration tests.
+`DurableOutbox.Testing` publishes the guarantee tests as methods a service calls against its own `DbContext` and schema, with no dependency on a test framework:
+
+```csharp
+namespace DurableOutbox.Testing;
+
+public sealed class OutboxContract<TContext> where TContext : DbContext
+{
+    // addDbContext registers TContext against a database whose outbox table the service's migrations created.
+    public OutboxContract(Action<IServiceCollection> addDbContext);
+
+    public Task WrittenWithTheChangeAsync(CancellationToken cancellationToken = default);   // guarantee 1
+    public Task AtLeastOnceAsync(CancellationToken cancellationToken = default);            // guarantee 2
+    public Task OneOwnerAtATimeAsync(CancellationToken cancellationToken = default);        // guarantee 3
+    public Task CrashIsAnAttemptAsync(CancellationToken cancellationToken = default);       // guarantee 4
+    public Task NeverDroppedAsync(CancellationToken cancellationToken = default);           // guarantee 5
+}
+```
+
+Each method builds its own service provider with the service's `DbContext`, a fake clock it moves itself, and handlers for kinds it generates for that call, so it never waits on real time and never touches the service's own messages. A method completes when its guarantee holds and throws `InvalidOperationException`, naming the guarantee and what differed, when it does not. The rows it wrote stay in the table, so the kit should be pointed at a database used only for tests. Guarantee 6 is a promise not made, so it has no method. The library's own tests prove guarantees 1 to 5 by calling these methods against two `DbContext` types with different schemas and table names, so there is one copy of each test.
+
+The kit also has `RunUntilIdleAsync`, for a service's integration tests:
+
+```csharp
+public static Task RunUntilIdleAsync<TContext>(this IServiceProvider services, CancellationToken cancellationToken = default)
+    where TContext : DbContext;
+```
+
+It runs the handlers registered for `TContext`, with their options, until no message of a registered kind is due and no attempt is running, then returns with every outcome written. It works with `RunWorkers` set to false, which is how a test host usually registers the outbox: `AddDurableOutbox` registers the handlers whatever `RunWorkers` says. It uses the service's `TimeProvider` and does not move it, so a message whose next attempt is in the future is left for later. It throws `InvalidOperationException` when no handler is registered for `TContext`, or when the start-up check fails.
 
 ### 9.13 Operating notes and known limits
 
@@ -497,6 +599,10 @@ The library's own tests run against PostgreSQL in Testcontainers, with a fake `T
 - **Vacuum.** Each message is updated at least twice, and those updates touch an indexed column. On a busy table, autovacuum should be set to run more often than the default.
 - **Connections.** Each kind uses up to `MaxConcurrency` connections for handlers, plus one for claiming and renewal. All kinds share the service's connection pool, so the pool must cover the sum of every kind's `MaxConcurrency`, plus one per kind, plus what the service's own requests need. A pool smaller than that lets one busy kind starve the others and the service itself.
 - **Slow work within a kind.** Kinds are isolated from each other, but messages of one kind share its slots. If a kind sends to several destinations and one is slow, that destination can hold every slot. Register a separate kind for work that must not be held up.
+- **Gauge sampling.** Every process that runs workers or registers the health check reads every pending and parked index entry of the table every 15 seconds (9.11). It is the same set of entries an idle claim reads, at a much lower rate, but a table with millions of waiting messages pays it in each such process.
+- **Counting inserts.** `durable_outbox.messages.enqueued` counts a message when `AddAsync` inserts it, so a transaction that rolls back afterwards still counts it.
+- **Cancel latency.** An operator cancel refuses the running attempt's outcome at once, but its handler is cancelled only at the next renewal, up to a third of the lease later.
+- **Retry window after an operator retry.** An operator retry resets the attempts but not the creation time, so a message of a kind with a retry window that has passed gets exactly one attempt per retry (9.7).
 
 ### 9.14 Design decisions made
 
@@ -510,6 +616,11 @@ The library's own tests run against PostgreSQL in Testcontainers, with a fake `T
 | 6 | A handler's token is also cancelled when its lease end passes without a renewal that reached the database. | During an outage another instance can take the message. Stopping the first handler costs one attempt, which is cheaper than a repeated send. |
 | 7 | Options are checked when the registration call runs, and copied. | It fails in the line that is wrong, before the host starts, and a later change to the options object cannot change a running worker. |
 | 8 | The workers' log messages arrive with the workers, not with the rest of the telemetry. | The loop's failures (an unreachable database, a lost lease) would otherwise be silent until the metrics exist. |
+| 9 | The retry window applies only to a message that has been attempted. | An operator retry resets the attempts but not the creation time; without this, a message parked by its window would be parked again at once, with no attempt. |
+| 10 | The operator statements write the status into the SQL text and accept only `Parked` and `Rejected` for lists. | A status passed as a parameter cannot be matched to a partial index, and the other statuses have no index to page by finish time on. |
+| 11 | The gauges are sampled every 15 seconds by one statement and read from memory. | A query inside the gauge callback would let the metrics collector decide the database load, and the health check would query on every probe. |
+| 12 | The start-up check gates the workers and retries an unreachable database instead of failing the start. | A table that does not match is a deployment error and must stop the host; a database that is briefly down is not, and the loop already survives it. |
+| 13 | The test kit depends on the exact same version of the library and on `Microsoft.Extensions.TimeProvider.Testing`. | It runs the library's own claim and worker internals against the service's schema, and moves a fake clock as the library's tests do. |
 
 ### 9.15 What is verified
 
@@ -528,7 +639,16 @@ Built and tested against PostgreSQL 17 (change `add-outbox-workers`), with the r
 - Lease renewal (9.8): a renewed lease is not taken over across two claims, and a handler whose lease is lost, or whose lease ran out during an outage, is cancelled with nothing recorded. With renewal removed from the loop, three of these tests fail.
 - The attempt timeout, including a handler that ignores its token; the backoff range; `RetryAt`; `Done(record)` in all three outcomes; and error text redacted and cut before it is stored or logged.
 
-Not built, and so still a design: the operator API (9.10), metrics, tracing, the health check and the start-up check (9.11), and the test kit (9.12). The operator index in 9.3 arrives with the operator API. Nothing has been run on PostgreSQL 14 to 16.
+Built and tested against PostgreSQL 17 (change `add-operations-and-release`):
+
+- The operator index (9.3), and the retry window applied only after an attempt (9.7): a message older than its window with no attempts is claimed as attempt 1; with the old rule the same test fails.
+- The operator API (9.10): listing by status and kind, newest first, and paging over messages finished in the same instant; retry and cancel only from the statuses they apply to; and a cancel during an attempt, which cancels the handler at the next renewal and leaves the message `Cancelled`.
+- Telemetry (9.11): the counters and the duration by outcome, including `abandoned` and `expired`; the gauges from one sample, with a message under a live claim not counted as due; the consumer activity, current inside the handler, with the writer's activity as its parent; and the health check, `Degraded` past its limit and when a sample fails.
+- The start-up check (9.11): a missing column or index is reported by name, an extra column of the service's is allowed, and nothing is claimed; a database unreachable at start-up delays the check without stopping it.
+- The test kit (9.12): guarantees 1 to 5 run as the kit's methods against `svc.outbox` and against a second context mapping `contract.messages`, beside a message of the service's own that they leave unchanged. With the claim's `FOR UPDATE SKIP LOCKED` removed, and separately with `lease_token = @token` removed from the completion, guarantee 3 fails for both contexts. `RunUntilIdleAsync` runs handlers with `RunWorkers` false and returns with a retried message left for later.
+- Both packages pack with the MIT licence, the readme and symbols, and the kit depends on exactly the same version of the library.
+
+Not yet verified: nothing has been run on PostgreSQL 14 to 16, and the GitHub Actions workflows have not run, because the repository has not been pushed. Their steps were run locally.
 
 ## 10. Sources
 

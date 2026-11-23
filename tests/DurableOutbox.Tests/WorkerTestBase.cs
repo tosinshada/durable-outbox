@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using DurableOutbox.Testing;
 using Microsoft.Extensions.Logging;
 using Xunit;
 
@@ -15,7 +16,6 @@ public abstract class WorkerTestBase(PostgresFixture postgres) : OutboxTestBase(
 {
     protected const string OtherKind = "invoice.file";
     protected static readonly TimeSpan Step = TimeSpan.FromSeconds(1);
-    private const int MaxSteps = 1_000;
 
     private readonly PostgresFixture _postgres = postgres;
     private ServiceProvider? _workerServices;
@@ -53,67 +53,32 @@ public abstract class WorkerTestBase(PostgresFixture postgres) : OutboxTestBase(
         }
     }
 
+    /// <summary>A singleton of the workers' container.</summary>
+    private protected T WorkerService<T>() where T : notnull => _workerServices!.GetRequiredService<T>();
+
+    /// <summary>The started hosted service of type <typeparamref name="T"/>.</summary>
+    private protected T Hosted<T>() where T : IHostedService => _hosted.OfType<T>().Single();
+
     protected Task SetDatabaseReachableAsync(bool reachable) =>
         _postgres.SetConnectionsAllowedAsync(ConnectionString, reachable, Ct);
 
-    /// <summary>Waits until every loop is waiting on the clock and no attempt is starting or writing its outcome.</summary>
-    protected Task IdleAsync() =>
-        Task.WhenAll(_hosted.OfType<OutboxWorker<TestDbContext>>().Select(worker => worker.IdleAsync())).WaitAsync(Ct);
+    /// <summary>The kit's clock helper, over the workers and samplers this test started.</summary>
+    private WorkerClock Clock => WorkerClock.For<TestDbContext>(Time, _hosted, Ct);
+
+    /// <summary>
+    /// Waits until every loop is waiting on the clock with no attempt starting or writing its outcome, and no
+    /// gauge sample is being taken.
+    /// </summary>
+    protected Task IdleAsync() => Clock.IdleAsync();
 
     /// <summary>Moves the clock in steps, each once the workers are idle, until <paramref name="signal"/> completes.</summary>
-    protected async Task AdvanceUntilAsync(Task signal, TimeSpan step)
-    {
-        for (var steps = 0; !signal.IsCompleted; steps++)
-        {
-            await IdleAsync();
-            if (signal.IsCompleted)
-            {
-                break;
-            }
-
-            Advance(step, steps);
-            await Task.Yield();
-        }
-
-        await signal;
-    }
+    protected Task AdvanceUntilAsync(Task signal, TimeSpan step) => Clock.AdvanceUntilAsync(signal, step);
 
     /// <summary>Moves the clock in steps, each once the workers are idle, until <paramref name="condition"/> holds.</summary>
-    protected async Task AdvanceUntilAsync(Func<Task<bool>> condition, TimeSpan step)
-    {
-        for (var steps = 0; ; steps++)
-        {
-            await IdleAsync();
-            if (await condition())
-            {
-                return;
-            }
-
-            Advance(step, steps);
-        }
-    }
-
-    /// <summary>Fails a test whose signal never comes, on the fake clock, instead of letting it run forever.</summary>
-    private void Advance(TimeSpan step, int stepsTaken)
-    {
-        Assert.True(stepsTaken < MaxSteps, $"Nothing happened after moving the clock {MaxSteps} times by {step}.");
-        Time.Advance(step);
-    }
+    protected Task AdvanceUntilAsync(Func<Task<bool>> condition, TimeSpan step) => Clock.AdvanceUntilAsync(condition, step);
 
     /// <summary>Moves the clock forward by <paramref name="by"/>, in steps taken while the workers are idle.</summary>
-    protected async Task AdvanceAsync(TimeSpan by, TimeSpan step)
-    {
-        var until = Time.GetUtcNow() + by;
-        while (Time.GetUtcNow() < until)
-        {
-            await IdleAsync();
-            var left = until - Time.GetUtcNow();
-            Time.Advance(left < step ? left : step);
-            await Task.Yield();
-        }
-
-        await IdleAsync();
-    }
+    protected Task AdvanceAsync(TimeSpan by, TimeSpan step) => Clock.AdvanceAsync(by, step);
 
     public override async ValueTask DisposeAsync()
     {

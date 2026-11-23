@@ -8,4 +8,5 @@ internal static class OutboxStatus
     public const string Rejected = "Rejected";
     public const string Parked = "Parked";
     public const string Expired = "Expired";
+    public const string Cancelled = "Cancelled";
 }

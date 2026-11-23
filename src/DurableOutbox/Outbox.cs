@@ -6,7 +6,8 @@ using NpgsqlTypes;
 
 namespace DurableOutbox;
 
-internal sealed class Outbox<TContext>(TContext context, OutboxSqlProvider<TContext> sql, TimeProvider time) : IOutbox
+internal sealed class Outbox<TContext>(TContext context, OutboxSqlProvider<TContext> sql, TimeProvider time, OutboxMetrics metrics)
+    : IOutbox
     where TContext : DbContext
 {
     public async Task<bool> AddAsync(OutboxMessage message, CancellationToken cancellationToken = default)
@@ -42,6 +43,11 @@ internal sealed class Outbox<TContext>(TContext context, OutboxSqlProvider<TCont
                 new NpgsqlParameter("trace_parent", NpgsqlDbType.Text) { Value = (object?)Activity.Current?.Id ?? DBNull.Value },
             ],
             cancellationToken);
+
+        if (inserted == 1)
+        {
+            metrics.Enqueued(message.Kind);
+        }
 
         return inserted == 1;
     }

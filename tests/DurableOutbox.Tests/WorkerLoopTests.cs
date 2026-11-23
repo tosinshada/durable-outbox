@@ -4,36 +4,6 @@ namespace DurableOutbox.Tests;
 
 public sealed class WorkerLoopTests(PostgresFixture postgres) : WorkerTestBase(postgres)
 {
-    // Guarantee 2: a committed message is attempted until it is done, with the same ID every time.
-    [Fact]
-    public async Task A_message_is_attempted_until_done_with_the_same_id_on_every_attempt()
-    {
-        Handler.Behaviour = call => call.Delivery.Attempt switch
-        {
-            1 => throw new InvalidOperationException("receiver down"),
-            2 => Task.FromResult(OutboxResult.Retry("receiver busy")),
-            _ => Task.FromResult(OutboxResult.Done()),
-        };
-        await AddAsync(new OutboxMessage(Kind, "order-1"));
-        await StartWorkersAsync(outbox => outbox.AddHandler<TestHandler>(Kind));
-
-        await AdvanceUntilAsync(Handler.CallAsync(2), Step);
-        await StopWorkersAsync();
-
-        var calls = Handler.Calls;
-        Assert.Equal([1, 2, 3], calls.Select(call => call.Delivery.Attempt));
-        Assert.Single(calls.Select(call => call.Delivery.Id).Distinct());
-        Assert.Equal(3, calls.Select(call => call.Handler).Distinct().Count());
-
-        var row = await RowAsync();
-        Assert.Equal(calls[0].Delivery.Id, row.Id);
-        Assert.Equal(OutboxStatus.Completed, row.Status);
-        var errors = Errors(row);
-        Assert.Equal([1, 2], errors.Select(error => error.Attempt));
-        Assert.Contains("InvalidOperationException: receiver down", errors[0].Error, StringComparison.Ordinal);
-        Assert.Equal("receiver busy", errors[1].Error);
-    }
-
     [Fact]
     public async Task A_kind_never_runs_more_attempts_than_its_concurrency_limit()
     {

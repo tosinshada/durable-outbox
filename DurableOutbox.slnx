@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/DurableOutbox/DurableOutbox.csproj" />
+    <Project Path="src/DurableOutbox.Testing/DurableOutbox.Testing.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/DurableOutbox.Tests/DurableOutbox.Tests.csproj" />

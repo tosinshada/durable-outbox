@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| Status | Changes 1 and 2 are built, tested and archived. Change 3 is not started. |
+| Status | Changes 1, 2 and 3 are built, tested and archived. Publishing to nuget.org is still a separate, manual step. |
 | Date | 2026-11-23 |
 | Design | [durable-outbox.md](durable-outbox.md). Section numbers below refer to it. |
 
@@ -113,6 +113,8 @@ If the claim statement needs to change to pass, section 9.7 is corrected in this
 | Package metadata, MIT licence, README with the adoption steps (registration, one migration, one handler) and the operating notes | 5.1, 9.13 |
 | A build-and-test pipeline, and a publish step run by hand | 6, decisions 7 and 11 |
 
+Two choices were made while proposing this change: the retry window applies only to a message that has been attempted, so an operator retry always gets an attempt; and the start-up check retries an unreachable database instead of failing the start. The kit depends on `Microsoft.Extensions.TimeProvider.Testing`, and publishing uses nuget.org Trusted Publishing instead of a stored API key.
+
 **Done when** these pass, and both packages build with `dotnet pack`:
 
 - An operator retry makes a parked message claimable, with attempts reset and errors kept.
@@ -121,7 +123,7 @@ If the claim statement needs to change to pass, section 9.7 is corrected in this
 - The start-up check fails on a table with a missing column or index.
 - The kit's contract tests pass against a second `DbContext` with a different schema and table name.
 
-Publishing to nuget.org is a separate, manual step after this change is archived. It needs the owner's approval and API key.
+Publishing to nuget.org is a separate, manual step after this change is archived. It needs the owner's approval, and the one-time setup in the README's release section.
 
 ## After version 1
 

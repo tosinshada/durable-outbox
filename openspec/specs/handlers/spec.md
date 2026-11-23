@@ -28,11 +28,15 @@ The registration call SHALL throw `ArgumentException` before returning when an o
 - **THEN** the registration call throws `ArgumentException`
 
 ### Requirement: Workers run only in a process that asks for them
-Workers SHALL start with the host when at least one handler is registered and `RunWorkers` is true, which is the default. When `RunWorkers` is false, or no handler is registered, the registration SHALL provide the writer only and nothing SHALL be claimed.
+Workers SHALL start with the host when at least one handler is registered and `RunWorkers` is true, which is the default. When `RunWorkers` is false, or no handler is registered, no worker SHALL start with the host and the host SHALL claim nothing. The handlers and their options SHALL be registered whatever `RunWorkers` says, so that a test can run them with `RunUntilIdleAsync`.
 
 #### Scenario: Process that only writes
 - **WHEN** a service registers a handler with `RunWorkers` set to false, starts its host and commits a message
 - **THEN** the message stays `Pending` with zero attempts
+
+#### Scenario: Handlers run on demand
+- **WHEN** a service registers a handler with `RunWorkers` set to false, commits a message and calls `RunUntilIdleAsync`
+- **THEN** the handler is given the message
 
 ### Requirement: Each attempt runs in its own scope with the message's details
 Each attempt SHALL run in a new dependency-injection scope, with a handler resolved from that scope. The handler SHALL receive the message ID, kind, record reference, attempt number, creation time and deadline. The ID SHALL be the same on every attempt of a message.

@@ -24,11 +24,11 @@ The column names SHALL be those in section 9.3, whatever naming convention the s
 - **THEN** each writes to and claims from its own table only
 
 ### Requirement: The table carries the claim and uniqueness indexes
-The configuration SHALL define an index on `(kind, priority DESC, next_attempt_at)` holding only rows with status `Pending`, and a unique index on `(kind, unique_key)` holding only rows with a uniqueness key.
+The configuration SHALL define an index on `(kind, priority DESC, next_attempt_at)` holding only rows with status `Pending`, a unique index on `(kind, unique_key)` holding only rows with a uniqueness key, and an index on `(kind, finished_at)` holding only rows with status `Parked` or `Rejected`, which serves the operator lists and the parked gauge.
 
 #### Scenario: Generated migration
 - **WHEN** a service generates its migration from the configuration
-- **THEN** it contains both indexes with their filters
+- **THEN** it contains all three indexes with their filters
 
 ### Requirement: The library deletes nothing
 The library SHALL NOT delete a row. A message that reaches a final status SHALL stay in the table with that status and the time it finished.

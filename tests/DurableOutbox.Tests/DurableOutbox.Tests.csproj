@@ -11,5 +11,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\DurableOutbox\DurableOutbox.csproj" />
+    <ProjectReference Include="..\..\src\DurableOutbox.Testing\DurableOutbox.Testing.csproj" />
   </ItemGroup>
 </Project>

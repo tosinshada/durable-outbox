@@ -19,6 +19,8 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
     private readonly TimeProvider _time;
     private readonly ILogger _logger;
     private readonly TimeSpan _renewEvery;
+    private readonly Task _schemaChecked;
+    private readonly OutboxMetrics _metrics;
 
     private readonly Lock _gate = new();
     private readonly HashSet<Attempt> _running = [];
@@ -26,14 +28,29 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
     private TaskCompletionSource _idle = NewSignal();
     private bool _waiting;
     private bool _finished;
+    private int _released;
 
     // Touched by the loop only.
+    private readonly bool _stopWhenIdle;
     private DateTimeOffset _nextClaim;
     private DateTimeOffset _nextRenewal;
     private int _claimFailures;
+    private bool _lastClaimFull = true;
+    private int _releasedAtClaim;
 
-    public KindLoop(KindSettings kind, OutboxSettings settings, IServiceScopeFactory scopes, TimeProvider time, ILogger logger)
+    public KindLoop(
+        KindSettings kind,
+        OutboxSettings settings,
+        IServiceScopeFactory scopes,
+        TimeProvider time,
+        ILogger logger,
+        OutboxMetrics metrics,
+        Task schemaChecked,
+        bool stopWhenIdle)
     {
+        _schemaChecked = schemaChecked;
+        _stopWhenIdle = stopWhenIdle;
+        _metrics = metrics;
         _kind = kind;
         _settings = settings;
         _scopes = scopes;
@@ -59,12 +76,21 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
 
     public async Task RunAsync(CancellationToken stoppingToken)
     {
-        _nextClaim = _time.GetUtcNow();
-        _nextRenewal = _nextClaim + _renewEvery;
-
         using var stopping = stoppingToken.Register(Wake);
         try
         {
+            try
+            {
+                await _schemaChecked.WaitAsync(stoppingToken);
+            }
+            catch (Exception)
+            {
+                // Stopped before the start-up check passed, or the table does not match: claim nothing.
+                return;
+            }
+
+            _nextClaim = _time.GetUtcNow();
+            _nextRenewal = _nextClaim + _renewEvery;
             await ServeAsync(stoppingToken);
             await DrainAsync();
         }
@@ -96,6 +122,27 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
             }
 
             var free = FreeSlots();
+            if (_stopWhenIdle)
+            {
+                // More may be due when the last claim was full, or an attempt has finished since it ran (its
+                // outcome can make a message due again). Otherwise, once nothing runs, nothing is due.
+                var (released, running) = ReleasedAndRunning();
+                var moreMayBeDue = _lastClaimFull || released != _releasedAtClaim;
+                if (!moreMayBeDue && running == 0)
+                {
+                    return;
+                }
+
+                if (free > 0 && moreMayBeDue && now >= _nextClaim)
+                {
+                    await ClaimAsync(free);
+                    continue;
+                }
+
+                await WaitAsync((free > 0 && moreMayBeDue && _nextClaim < _nextRenewal ? _nextClaim : _nextRenewal) - now);
+                continue;
+            }
+
             if (free > 0 && now >= _nextClaim)
             {
                 await ClaimAsync(free);
@@ -151,6 +198,11 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
     private async Task ClaimAsync(int free)
     {
         var now = _time.GetUtcNow();
+        lock (_gate)
+        {
+            _releasedAtClaim = _released;
+        }
+
         ClaimBatch batch;
         try
         {
@@ -164,26 +216,39 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
             var delay = Backoff.Outage(_claimFailures, _settings.PollInterval);
             OutboxLog.DatabaseUnreachable(_logger, _kind.Kind, "claim", delay, exception);
             _nextClaim = now + delay;
+            _lastClaimFull = true;
             return;
         }
 
         _claimFailures = 0;
         foreach (var message in batch.Messages)
         {
+            if (message.Abandoned)
+            {
+                _metrics.Abandoned(_kind.Kind);
+            }
+
             if (message.Status == OutboxStatus.Pending)
             {
                 var delivery = new OutboxDelivery(
                     message.Id, _kind.Kind, message.RecordRef, message.Attempt, message.CreatedAt, message.Deadline);
-                Start(new Attempt(delivery, batch.Token, now + _kind.Lease));
+                Start(new Attempt(delivery, batch.Token, now + _kind.Lease) { TraceParent = message.TraceParent });
             }
             else
             {
+                if (message.Status == OutboxStatus.Expired)
+                {
+                    _metrics.Expired(_kind.Kind);
+                }
+
                 OutboxLog.EndedByClaim(_logger, message.Id, _kind.Kind, message.RecordRef, message.Status);
             }
         }
 
-        // A full claim means more may be waiting: claim again as soon as a slot is free.
-        _nextClaim = batch.Messages.Count >= free ? now : now + Backoff.Poll(_settings.PollInterval);
+        // A full claim means more may be waiting: claim again as soon as a slot is free. A loop that stops when
+        // idle never waits for the poll.
+        _lastClaimFull = batch.Messages.Count >= free;
+        _nextClaim = _lastClaimFull || _stopWhenIdle ? now : now + Backoff.Poll(_settings.PollInterval);
     }
 
     /// <summary>
@@ -284,7 +349,7 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
                 OutboxLog.AttemptTimedOut(_logger, attempt.Id, _kind.Kind, attempt.Delivery.Attempt);
                 await using (var fresh = _scopes.CreateAsyncScope())
                 {
-                    await FailAsync(fresh.ServiceProvider, attempt, Error(ErrorText.TimedOut), NextAttempt(attempt));
+                    await FailAsync(fresh.ServiceProvider, attempt, Error(ErrorText.TimedOut), NextAttempt(attempt), timedOut: true);
                 }
 
                 _ = ObserveLateHandlerAsync(handler, scope, attempt);
@@ -300,6 +365,7 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
         }
         finally
         {
+            Finish(attempt);
             if (!handlerStillRunning)
             {
                 await scope.DisposeAsync();
@@ -312,6 +378,10 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
 
     private async Task<OutboxResult> InvokeAsync(IServiceProvider services, Attempt attempt)
     {
+        // Current for the handler, so its own calls join the writer's trace.
+        attempt.Activity = OutboxActivity.StartAttempt(attempt.Delivery, attempt.TraceParent);
+        attempt.StartedAt = _time.GetTimestamp();
+
         Task<OutboxResult> pending;
         try
         {
@@ -359,6 +429,7 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
 
         if (ReasonOf(attempt) == CancelReason.LeaseLost)
         {
+            attempt.Outcome = AttemptOutcome.LeaseLost;
             return;
         }
 
@@ -371,12 +442,16 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
                 await FailAsync(services, attempt, Error(retry.Error), retry.At ?? NextAttempt(attempt));
                 break;
             case RejectResult reject:
-                await WriteAsync(services, attempt, store => store.RejectAsync(
-                    attempt.Id, attempt.Token, Error(reject.Reason), CancellationToken.None));
+                await WriteAsync(services, attempt, async store => await store.RejectAsync(
+                    attempt.Id, attempt.Token, Error(reject.Reason), CancellationToken.None)
+                    ? AttemptOutcome.Rejected
+                    : AttemptOutcome.LeaseLost);
                 break;
             default:
-                await WriteAsync(services, attempt, store => store.CompleteAsync(
-                    attempt.Id, attempt.Token, CancellationToken.None));
+                await WriteAsync(services, attempt, async store => await store.CompleteAsync(
+                    attempt.Id, attempt.Token, CancellationToken.None)
+                    ? AttemptOutcome.Completed
+                    : AttemptOutcome.LeaseLost);
                 break;
         }
     }
@@ -386,11 +461,15 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
     {
         switch (ReasonOf(attempt))
         {
-            case CancelReason.LeaseLost or CancelReason.DrainEnded:
+            case CancelReason.LeaseLost:
+                attempt.Outcome = AttemptOutcome.LeaseLost;
+                return;
+            case CancelReason.DrainEnded:
+                // Nothing is recorded: the next claim finds the attempt abandoned and counts it.
                 return;
             case CancelReason.TimedOut:
                 OutboxLog.AttemptTimedOut(_logger, attempt.Id, _kind.Kind, attempt.Delivery.Attempt);
-                await FailAsync(services, attempt, Error(ErrorText.TimedOut), NextAttempt(attempt));
+                await FailAsync(services, attempt, Error(ErrorText.TimedOut), NextAttempt(attempt), timedOut: true);
                 return;
             default:
                 var error = Error(exception.ToString());
@@ -433,26 +512,45 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
             return;
         }
 
+        attempt.Outcome = completed ? AttemptOutcome.Completed : AttemptOutcome.LeaseLost;
         if (!completed)
         {
             OutboxLog.OutcomeRefused(_logger, attempt.Id, _kind.Kind, attempt.Delivery.Attempt);
         }
     }
 
-    private Task FailAsync(IServiceProvider services, Attempt attempt, string error, DateTimeOffset nextAttemptAt) =>
+    private Task FailAsync(
+        IServiceProvider services, Attempt attempt, string error, DateTimeOffset nextAttemptAt, bool timedOut = false) =>
         WriteAsync(services, attempt, async store => await store.FailAsync(
             attempt.Id, attempt.Token, error, nextAttemptAt, _kind.MaxAttempts, _kind.RetryWindow, CancellationToken.None)
-            != FailOutcome.Refused);
+            switch
+            {
+                FailOutcome.Refused => AttemptOutcome.LeaseLost,
+                FailOutcome.Parked => AttemptOutcome.Parked,
+                _ => timedOut ? AttemptOutcome.TimedOut : AttemptOutcome.Retry,
+            });
+
+    /// <summary>Counts the attempt by how it ended, and stops its activity. An attempt with no outcome is not counted.</summary>
+    private void Finish(Attempt attempt)
+    {
+        if (attempt.Outcome is { } outcome)
+        {
+            _metrics.Attempt(_kind.Kind, outcome, _time.GetElapsedTime(attempt.StartedAt));
+        }
+
+        OutboxActivity.Finish(attempt.Activity, attempt.Outcome);
+    }
 
     /// <summary>
     /// Writes an outcome with no cancellation token. A refused outcome means the lease was lost. A failed
     /// write is not retried: the message comes back after its lease as an abandoned attempt.
     /// </summary>
-    private async Task WriteAsync(IServiceProvider services, Attempt attempt, Func<OutboxStore<TContext>, Task<bool>> write)
+    private async Task WriteAsync(IServiceProvider services, Attempt attempt, Func<OutboxStore<TContext>, Task<string>> write)
     {
         try
         {
-            if (!await write(services.GetRequiredService<OutboxStore<TContext>>()))
+            attempt.Outcome = await write(services.GetRequiredService<OutboxStore<TContext>>());
+            if (attempt.Outcome == AttemptOutcome.LeaseLost)
             {
                 OutboxLog.OutcomeRefused(_logger, attempt.Id, _kind.Kind, attempt.Delivery.Attempt);
             }
@@ -517,11 +615,20 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
         }
     }
 
+    private (int Released, int Running) ReleasedAndRunning()
+    {
+        lock (_gate)
+        {
+            return (_released, _running.Count);
+        }
+    }
+
     private void Release(Attempt attempt)
     {
         lock (_gate)
         {
             _running.Remove(attempt);
+            _released++;
             UpdateIdle();
         }
 

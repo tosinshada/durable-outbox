@@ -31,4 +31,15 @@ internal static partial class OutboxLog
     [LoggerMessage(7, LogLevel.Information,
         "Outbox message {MessageId} ({Kind}, attempt {Attempt}): its outcome was refused because the lease was lost.")]
     public static partial void OutcomeRefused(ILogger logger, Guid messageId, string kind, int attempt);
+
+    [LoggerMessage(8, LogLevel.Warning,
+        "Outbox table {Table}: the database could not be reached for the start-up check; trying again in {RetryIn}. The workers claim nothing until it passes.")]
+    public static partial void SchemaCheckUnreachable(ILogger logger, string table, TimeSpan retryIn, Exception exception);
+
+    [LoggerMessage(9, LogLevel.Critical,
+        "Outbox table {Table} does not match what DurableOutbox expects: {Differences}. The workers will not start.")]
+    public static partial void SchemaMismatch(ILogger logger, string table, string differences);
+
+    [LoggerMessage(10, LogLevel.Warning, "Outbox table {Table}: the gauges could not be sampled.")]
+    public static partial void SampleFailed(ILogger logger, string table, Exception exception);
 }

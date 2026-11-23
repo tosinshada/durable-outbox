@@ -38,6 +38,9 @@ public abstract class OutboxTestBase(PostgresFixture postgres) : IAsyncLifetime
 
     public virtual async ValueTask DisposeAsync() => await _services.DisposeAsync();
 
+    /// <summary>A singleton of the container the helpers here use, such as its <see cref="OutboxMetrics"/>.</summary>
+    private protected T Service<T>() where T : notnull => _services.GetRequiredService<T>();
+
     protected async Task InScopeAsync(Func<IServiceProvider, Task> work)
     {
         await using var scope = _services.CreateAsyncScope();

@@ -13,4 +13,7 @@ internal sealed class ClaimedMessage
     public DateTimeOffset CreatedAt { get; init; }
     public DateTimeOffset? Deadline { get; init; }
     public string? TraceParent { get; init; }
+
+    /// <summary>True when the previous attempt never reported: the claim found it still under a lease token.</summary>
+    public bool Abandoned { get; init; }
 }

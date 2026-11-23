@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace DurableOutbox;
 
+/// <summary>Adds the outbox table to a service's EF Core model.</summary>
 public static class OutboxModelBuilderExtensions
 {
     /// <summary>
@@ -44,6 +45,11 @@ public static class OutboxModelBuilderExtensions
                 .IsUnique()
                 .HasFilter("unique_key IS NOT NULL")
                 .HasDatabaseName($"ux_{table}_unique_key");
+
+            // Operator lists and the parked gauge.
+            row.HasIndex(x => new { x.Kind, x.FinishedAt })
+                .HasFilter("status IN ('Parked', 'Rejected')")
+                .HasDatabaseName($"ix_{table}_finished");
         });
 
         return modelBuilder;

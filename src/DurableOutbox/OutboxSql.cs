@@ -9,8 +9,11 @@ internal sealed class OutboxSql
     /// <summary>The error history keeps this many entries, the most recent.</summary>
     public const int ErrorHistoryLimit = 20;
 
-    /// <summary>True when the row has no attempts left, by count or by age.</summary>
-    private const string Spent = "attempts >= @max_attempts OR created_at <= @give_up_before";
+    /// <summary>
+    /// True when the row has no attempts left, by count or by age. The retry window applies only once the
+    /// message has been attempted, so a message with no attempts (new, or reset by an operator) is claimed.
+    /// </summary>
+    private const string Spent = "attempts >= @max_attempts OR (attempts > 0 AND created_at <= @give_up_before)";
 
     public OutboxSql(string table)
     {
@@ -49,7 +52,8 @@ internal sealed class OutboxSql
               FROM due
              WHERE m.id = due.id
             RETURNING m.id AS "Id", m.record_ref AS "RecordRef", m.status AS "Status", m.attempts AS "Attempt",
-                      m.created_at AS "CreatedAt", m.deadline_at AS "Deadline", m.trace_parent AS "TraceParent"
+                      m.created_at AS "CreatedAt", m.deadline_at AS "Deadline", m.trace_parent AS "TraceParent",
+                      due.abandoned AS "Abandoned"
             """;
 
         Complete = $"""
@@ -92,7 +96,33 @@ internal sealed class OutboxSql
              WHERE m.id = held.id
             RETURNING m.id AS "Value"
             """;
+
+        Retry = $"""
+            UPDATE {table}
+               SET status = 'Pending', attempts = 0, next_attempt_at = @now, lease_token = NULL, finished_at = NULL
+             WHERE id = @id AND status IN ('Parked', 'Rejected')
+            """;
+
+        Cancel = $"""
+            UPDATE {table}
+               SET status = 'Cancelled', finished_at = @now, lease_token = NULL
+             WHERE id = @id AND status IN ('Pending', 'Parked')
+            """;
+
+        Sample = $"""
+            SELECT kind AS "Kind", count(*) AS "Pending", 0::bigint AS "Parked",
+                   min(next_attempt_at) FILTER (WHERE next_attempt_at <= @now) AS "OldestDue"
+              FROM {table} WHERE status = 'Pending' GROUP BY kind
+            UNION ALL
+            SELECT kind, 0, count(*), NULL
+              FROM {table} WHERE status = 'Parked' GROUP BY kind
+            """;
+
+        Table = table;
     }
+
+    /// <summary>The schema-qualified table name, delimited as the SQL writes it.</summary>
+    public string Table { get; }
 
     public string Insert { get; }
     public string Claim { get; }
@@ -105,6 +135,32 @@ internal sealed class OutboxSql
     /// statement has locked; a row skipped counts as not renewed.
     /// </summary>
     public string Renew { get; }
+
+    /// <summary>The gauges' figures per kind, each half served by one partial index. A live claim is not due.</summary>
+    public string Sample { get; }
+
+    /// <summary>Operator retry: <c>Parked</c> or <c>Rejected</c> back to <c>Pending</c>, attempts reset, errors kept.</summary>
+    public string Retry { get; }
+
+    /// <summary>Operator cancel. Clearing the token refuses the outcome of an attempt that holds the message.</summary>
+    public string Cancel { get; }
+
+    /// <summary>
+    /// The operator list for one status, newest finished first. <paramref name="status"/> is written into
+    /// the text, never passed as a parameter, so the planner can match the operator index's filter; callers
+    /// pass only <see cref="OutboxStatus.Parked"/> or <see cref="OutboxStatus.Rejected"/>.
+    /// </summary>
+    public string List(string status, bool byKind, bool afterEntry) => $"""
+        SELECT id AS "Id", kind AS "Kind", record_ref AS "RecordRef", unique_key AS "UniqueKey",
+               priority AS "Priority", status AS "Status", attempts AS "Attempts", created_at AS "CreatedAt",
+               deadline_at AS "Deadline", finished_at AS "FinishedAt", last_error AS "LastError", errors AS "Errors"
+          FROM {Table}
+         WHERE status = '{status}'
+               {(byKind ? "AND kind = @kind" : "")}
+               {(afterEntry ? "AND (finished_at, id) < (@after_finished_at, @after_id)" : "")}
+         ORDER BY finished_at DESC, id DESC
+         LIMIT @limit
+        """;
 
     /// <summary>
     /// The row's error history with one entry added for its current attempt, cut to the most recent

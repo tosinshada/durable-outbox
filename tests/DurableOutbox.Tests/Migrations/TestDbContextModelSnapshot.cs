@@ -95,6 +95,10 @@ namespace DurableOutbox.Tests.Migrations
                     b.HasKey("Id")
                         .HasName("pk_outbox");
 
+                    b.HasIndex("Kind", "FinishedAt")
+                        .HasDatabaseName("ix_outbox_finished")
+                        .HasFilter("status IN ('Parked', 'Rejected')");
+
                     b.HasIndex("Kind", "UniqueKey")
                         .IsUnique()
                         .HasDatabaseName("ux_outbox_unique_key")

@@ -6,4 +6,23 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
+
+  <!-- Package metadata. Projects that ship set IsPackable; nothing else packs. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <Version>1.0.0</Version>
+    <Authors>Tosin Shada</Authors>
+    <Copyright>Copyright (c) 2026 Tosin Shada</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>outbox;transactional-outbox;postgresql;efcore;npgsql</PackageTags>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EnablePackageValidation>true</EnablePackageValidation>
+    <!-- RepositoryUrl and PackageProjectUrl are set once the GitHub repository exists. -->
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+  </PropertyGroup>
 </Project>

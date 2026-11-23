@@ -1,0 +1,22 @@
+/reference-impl
+
+# Log files the service writes
+logs/
+
+# Build output
+bin/
+obj/
+TestResults/
+*.binlog
+
+# IDE and user files
+.vs/
+.idea/
+*.user
+*.suo
+
+# Local secrets and settings
+*.local.yaml
+*.local.json
+secrets.json
+/secrets/

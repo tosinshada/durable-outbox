@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "id-validation-api",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": ["run", "--project", "src/IdValidation.Api", "--launch-profile", "IdValidation.Api", "--no-build"],
+      "port": 50424
+    }
+  ]
+}

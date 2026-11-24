@@ -1,0 +1,6 @@
+root = true
+
+[*.cs]
+# Folders group files by design section; every file keeps its project's root namespace
+# (DurableOutbox, DurableOutbox.Testing, DurableOutbox.Tests), because a namespace is public API.
+dotnet_style_namespace_match_folder = false

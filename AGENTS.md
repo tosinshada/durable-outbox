@@ -27,6 +27,7 @@ DurableOutbox is a .NET 10 library that implements the transactional outbox patt
 - The public API is section 9 of the design. Everything else is `internal`. A public type or member is a promise to every user of the package: don't add or change one without changing the design first.
 - Code is added with its first caller in `src/` or `tests/`. No option, overload or interface without one. Delete what loses its last caller.
 - One type per file, named after the type. Warnings are errors.
+- Folders in `src/DurableOutbox` follow the sections of the design: `Registration` (9.6), `Writing` (9.4), `Handlers` (9.5), `Schema` (9.3), `Storage` (the claim and fenced outcomes, 9.7 and 9.8), `Worker` (9.8 and 9.9), `Operator` (9.10) and `Telemetry` (9.11). A file goes in the folder of its first caller's section. Folders never change namespaces: every file in a project stays in that project's root namespace.
 - Add no package dependency beyond those in section 9.1 without asking.
 
 ## Time

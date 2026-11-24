@@ -36,6 +36,8 @@ tests/DurableOutbox.Tests/     tests against PostgreSQL         (change 1)
 
 One test project. It has its own small `DbContext` and migration, as a service would.
 
+Inside the library, files are grouped in folders by design section (`Registration`, `Writing`, `Handlers`, `Schema`, `Storage`, `Worker`, `Operator`, `Telemetry`). The test project has `Support` (fixtures and base classes), `Model` (its `DbContext`s), `Migrations`, and one folder per tested area. Folders do not change namespaces.
+
 ## Change 1: `add-outbox-store`
 
 **Goal.** Prove the central design choice (9.2) against real PostgreSQL before anything is built on it. This is the "not yet verified" item in 9.15, and it comes first because every later change depends on it.

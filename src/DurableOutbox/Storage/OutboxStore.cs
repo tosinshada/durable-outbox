@@ -13,15 +13,20 @@ internal sealed class OutboxStore<TContext>(TContext context, OutboxSqlProvider<
 {
     internal const string AbandonedError = "The attempt did not report before its lease ended.";
 
+    /// <summary>
+    /// Claims due messages. With <paramref name="hold"/>, for a kind with a give-up hook, a spent or expired
+    /// message is held under the batch's token instead of ended, for <see cref="EndAsync"/>.
+    /// </summary>
     public async Task<ClaimBatch> ClaimAsync(
-        string kind, int limit, TimeSpan lease, int maxAttempts, TimeSpan? retryWindow, CancellationToken cancellationToken)
+        string kind, int limit, TimeSpan lease, int maxAttempts, TimeSpan? retryWindow, bool hold,
+        CancellationToken cancellationToken)
     {
         var now = time.GetUtcNow();
         var token = Guid.NewGuid();
 
         var messages = await context.Database
             .SqlQueryRaw<ClaimedMessage>(
-                sql.Get(context).Claim,
+                hold ? sql.Get(context).ClaimHolding : sql.Get(context).Claim,
                 new NpgsqlParameter("kind", NpgsqlDbType.Text) { Value = kind },
                 new NpgsqlParameter("limit", NpgsqlDbType.Integer) { Value = limit },
                 new NpgsqlParameter("token", NpgsqlDbType.Uuid) { Value = token },
@@ -45,31 +50,63 @@ internal sealed class OutboxStore<TContext>(TContext context, OutboxSqlProvider<
         return updated == 1;
     }
 
-    /// <summary>Retries at <paramref name="nextAttemptAt"/>, or parks when the attempts or the retry window are used up.</summary>
+    /// <summary>
+    /// Retries at <paramref name="nextAttemptAt"/>, or parks when the attempts or the retry window are used up.
+    /// With <paramref name="holdFor"/>, for a kind with a give-up hook, a spent message is held under its token
+    /// for that long instead of parked, for <see cref="EndAsync"/>.
+    /// </summary>
     public async Task<FailOutcome> FailAsync(
         Guid id, Guid token, string error, DateTimeOffset nextAttemptAt, int maxAttempts, TimeSpan? retryWindow,
-        CancellationToken cancellationToken)
+        TimeSpan? holdFor, CancellationToken cancellationToken)
     {
         var now = time.GetUtcNow();
+        List<NpgsqlParameter> parameters =
+        [
+            Id(id),
+            Token(token),
+            Now(now),
+            Error(error),
+            new NpgsqlParameter("next", NpgsqlDbType.TimestampTz) { Value = nextAttemptAt.ToUniversalTime() },
+            MaxAttempts(maxAttempts),
+            GiveUpBefore(now, retryWindow),
+        ];
+        if (holdFor is { } lease)
+        {
+            parameters.Add(new NpgsqlParameter("lease", NpgsqlDbType.Interval) { Value = lease });
+        }
 
         var statuses = await context.Database
             .SqlQueryRaw<string>(
-                sql.Get(context).Fail,
-                Id(id),
-                Token(token),
-                Now(now),
-                Error(error),
-                new NpgsqlParameter("next", NpgsqlDbType.TimestampTz) { Value = nextAttemptAt.ToUniversalTime() },
-                MaxAttempts(maxAttempts),
-                GiveUpBefore(now, retryWindow))
+                holdFor is null ? sql.Get(context).Fail : sql.Get(context).FailHolding,
+                [.. parameters])
             .ToListAsync(cancellationToken);
 
         return statuses switch
         {
             [] => FailOutcome.Refused,
-            [OutboxStatus.Parked] => FailOutcome.Parked,
+            [OutboxStatus.Parked] => holdFor is null ? FailOutcome.Parked : FailOutcome.Held,
             _ => FailOutcome.Retried,
         };
+    }
+
+    /// <summary>
+    /// Ends a held message as <paramref name="status"/> (<c>Parked</c> or <c>Expired</c>), and records
+    /// <paramref name="error"/> with it when there is one. False means the lease was lost.
+    /// </summary>
+    public async Task<bool> EndAsync(Guid id, Guid token, string status, string? error, CancellationToken cancellationToken)
+    {
+        var statements = sql.Get(context);
+        var updated = await context.Database.ExecuteSqlRawAsync(
+            status == OutboxStatus.Expired ? statements.EndExpired : statements.EndParked,
+            [
+                Id(id),
+                Token(token),
+                Now(time.GetUtcNow()),
+                new NpgsqlParameter("error", NpgsqlDbType.Text) { Value = (object?)error ?? DBNull.Value },
+            ],
+            cancellationToken);
+
+        return updated == 1;
     }
 
     public async Task<bool> RejectAsync(Guid id, Guid token, string reason, CancellationToken cancellationToken)

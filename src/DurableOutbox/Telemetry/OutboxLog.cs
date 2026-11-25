@@ -42,4 +42,9 @@ internal static partial class OutboxLog
 
     [LoggerMessage(10, LogLevel.Warning, "Outbox table {Table}: the gauges could not be sampled.")]
     public static partial void SampleFailed(ILogger logger, string table, Exception exception);
+
+    [LoggerMessage(11, LogLevel.Error,
+        "Outbox message {MessageId} ({Kind}, record {RecordRef}): its give-up hook failed, so it is ended as {Status} without the hook's writes: {Error}")]
+    public static partial void GiveUpHookFailed(
+        ILogger logger, Guid messageId, string kind, string recordRef, string status, string error);
 }

@@ -6,7 +6,10 @@ internal sealed class ClaimedMessage
     public Guid Id { get; init; }
     public string RecordRef { get; init; } = null!;
 
-    /// <summary><c>Pending</c> when it was claimed for handling; <c>Parked</c> or <c>Expired</c> when the claim ended it.</summary>
+    /// <summary>
+    /// <c>Pending</c> when it was claimed for handling; <c>Parked</c> or <c>Expired</c> when the claim ended it or,
+    /// for a kind with a give-up hook, holds it under the batch's token for the worker to end.
+    /// </summary>
     public string Status { get; init; } = null!;
 
     public int Attempt { get; init; }

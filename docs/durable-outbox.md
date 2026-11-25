@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Version 1.0.0 of `DurableOutbox` and of the test kit, `DurableOutbox.Testing`, is published on nuget.org, and later packs of `DurableOutbox` are checked against it for breaking changes. After 1.0.0 only `DurableOutbox` is published (section 6, decision 12). Section 9.15 has the detail. |
+| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Version 1.0.0 of `DurableOutbox` and of the test kit, `DurableOutbox.Testing`, is published on nuget.org, and later packs of `DurableOutbox` are checked against it for breaking changes. After 1.0.0 only `DurableOutbox` is published (section 6, decision 12). Version 1.1.0 adds the give-up hook (9.5), built and tested the same way; it is not yet published. Section 9.15 has the detail. |
 | Date | 2026-11-25 |
 | Next step | None set. Later work (section 5.5) goes through OpenSpec and is released by the steps in `docs/releasing.md`. |
 
@@ -96,7 +96,7 @@ These are the contract. Each one is proved by a test against real PostgreSQL.
 | Leases | Renewed while a handler is still running, so long work is not taken over. Time comes from `TimeProvider`. |
 | Timeouts | Per kind, an attempt that runs too long is cancelled and retried, so a hung handler cannot hold a slot forever. |
 | Retries | Per kind: attempt limit or retry window, exponential backoff with jitter and a cap. The attempt limit is enforced when claiming. |
-| Failure | Parked and expired states. An error is kept per attempt, passed through a hook the service supplies so sensitive text is not stored. |
+| Failure | Parked and expired states. An error is kept per attempt, passed through a hook the service supplies so sensitive text is not stored. Since 1.1.0, a kind's handler can be told when the library gives up on a message, and commit its own writes with the new status. |
 | Operators | In code: list parked messages, retry one, cancel one. |
 | Shutdown | Stop claiming, let running handlers finish within the host's timeout, and always record an outcome that was reached. |
 | Observability | Metrics for queue depth, age of the oldest due message, attempts, failures, parked and expired. Trace context carried from the writer to the handler. Structured logs. A health check for "oldest due message is too old". |
@@ -259,6 +259,13 @@ public abstract class OutboxResult      // only the library creates results
     public static OutboxResult RetryAt(DateTimeOffset at, string error);
     public static OutboxResult Reject(string reason);
 }
+
+public interface IOutboxGiveUpHandler   // optional, since 1.1.0: implemented by a kind's handler class
+{
+    Task OnGiveUpAsync(OutboxDelivery delivery, OutboxGiveUpReason reason, CancellationToken cancellationToken);
+}
+
+public enum OutboxGiveUpReason { AttemptsUsedUp, RetryWindowPassed, DeadlinePassed }
 ```
 
 - Each attempt runs in its own dependency-injection scope, with a handler resolved from it.
@@ -268,6 +275,18 @@ public abstract class OutboxResult      // only the library creates results
 - The token is also cancelled when the attempt runs longer than the kind's `AttemptTimeout`. The handler then has 5 seconds to return. A result it returns in that time is recorded. If it throws, or has not returned, the attempt is recorded as a retry with the error "timed out", and its slot is freed whether or not the handler has returned. That retry is written in a new scope, because the handler may still be using its own `DbContext`. A handler that ignores the token keeps running outside the concurrency limit, keeps its scope until it ends, and its late result is discarded, so handlers must honour the token.
 - `RetryAt` uses an attempt like any other retry. A time in the past makes the message due at once.
 - `Done(record)` is for follow-up database writes. After the handler returns, the library opens a transaction on the scope's `DbContext`, writes the fenced completion first, then runs `record` with the attempt's token, saves and commits. If the completion matches no row, `record` never runs. If `record`, the save or the commit throws, the transaction rolls back and the attempt is recorded as a failed one with that exception. Under a retrying execution strategy `record` can run more than once, so it must only touch the database. Changes the handler left tracked in the scope's `DbContext` are saved with `record`'s.
+
+**The give-up hook.** The library gives up on a message when it parks it (its attempts or its retry window are used up) or expires it (its deadline has passed). A handler never sees that happen: a failed last attempt is parked after the handler returned, and a message found spent or expired by the claim is never handed to a handler. A service whose record has a status of its own, such as a delivery that must become failed, needs to know. A kind has a give-up hook when the handler class registered for it also implements `IOutboxGiveUpHandler`. There is no option to set.
+
+- The library calls `OnGiveUpAsync` on every path that parks or expires a message of that kind: a failed attempt that leaves nothing, a claim that finds the message spent after an attempt that never reported, and a claim that finds it past its deadline. It is not called for `Reject`, where the handler already knows, or for an operator's cancel or retry.
+- The reason is `AttemptsUsedUp` or `RetryWindowPassed` when the message becomes `Parked`, and `DeadlinePassed` when it becomes `Expired`. When both the attempts and the window are used up, it is `AttemptsUsedUp`. `delivery.Attempt` is the number of attempts made, which is 0 for a message that expired before its first attempt.
+- The hook runs on a new handler instance from a scope of its own, never the scope of the failed attempt, so changes a failed handler left tracked are not saved.
+- The library opens a transaction on that scope's `DbContext`, writes the fenced status change first (9.8), then calls the hook, saves the `DbContext` and commits. The hook's writes are never stored without the status change. `IOutbox.AddAsync` works inside the hook, because a transaction is open.
+- If the status change matches no row, the lease was lost: the hook never runs and nothing is written.
+- If the hook, the save or the commit throws, the transaction rolls back, so none of the hook's writes are stored. The library then stores the status change on its own, fenced by the same token, with the error `The give-up hook failed:` followed by the exception, passed through `RedactError` and cut like every other error. It logs this at error level and counts it (9.11). So the message is never lost and never stays claimable, at the price that its status is stored without the hook's writes in this one case. Decision 15 in 9.14 has the reason. A failure that passes on its own, such as a dropped connection, is retried by the service's execution strategy when it has a retrying one, before the hook counts as failed.
+- The hook's token is cancelled at the end of the drain period on shutdown. If the hook throws after that, nothing is recorded, and the message is held again after its lease.
+- The hook can run more than once for one message: when a retrying execution strategy repeats the transaction, when a message was held and its end was never written, and once for each time a message is parked after an operator retry. So it must only touch the database and must be safe to repeat.
+- Nothing runs after the commit. A service raises its alert from its own record, or queues a message for it inside the hook.
 
 ### 9.6 Registration
 
@@ -348,6 +367,20 @@ What the one statement does:
 
 `@limit` is the number of free concurrency slots. Rows returned as `Parked` or `Expired` are counted and logged, not handled.
 
+A kind with a give-up hook (9.5) sends a second text of this statement instead. It is the same statement with the same `due` query, lock and order, and it differs only in what it writes to a row whose verdict is `Parked` or `Expired`. It does not end the row. It holds it: the row stays `Pending`, takes the claim's fresh token, and is due again at `@now + @lease`, with no attempt counted. The verdict is returned in place of the status. That is a claim like any other (9.2), so if the worker dies the row is due again after the lease and the next claim holds it again. The worker ends each held row in a transaction with the hook (9.8). A kind with no hook sends the statement above, unchanged.
+
+```sql
+UPDATE app.outbox_messages m
+   SET attempts        = m.attempts + (due.verdict = 'Pending')::int,
+       lease_token     = @token,
+       next_attempt_at = @now + @lease,
+       last_error      = CASE WHEN due.abandoned THEN @error ELSE m.last_error END,
+       errors          = CASE WHEN due.abandoned THEN <errors with this attempt appended> ELSE m.errors END
+  FROM due
+ WHERE m.id = due.id
+RETURNING m.id, m.record_ref, due.verdict AS status, m.attempts, m.created_at, m.deadline_at, m.trace_parent, due.abandoned;
+```
+
 ### 9.8 Outcomes and renewal
 
 Every outcome is one fenced statement, written with no cancellation token:
@@ -378,6 +411,29 @@ UPDATE app.outbox_messages
 ```
 
 A failed attempt chooses between retry and park inside the statement, from the row's own attempt count, so the choice cannot disagree with the row. One row affected means the outcome stands. None means the lease was lost: the result is discarded, logged and counted.
+
+For a kind with a give-up hook (9.5), a failed attempt that leaves nothing is not parked by its statement. A second text of the statement records the error and makes the same choice from the row, but holds a spent row: it stays `Pending` under the attempt's own token for a full lease. The worker then ends it. A retry is still one statement with no transaction.
+
+```sql
+-- Failed, for a kind with a give-up hook
+UPDATE app.outbox_messages
+   SET next_attempt_at = CASE WHEN <spent> THEN @now + @lease ELSE @next END,
+       lease_token     = CASE WHEN <spent> THEN lease_token END,
+       last_error      = @error,
+       errors          = <errors with this attempt appended>
+ WHERE id = @id AND lease_token = @token AND status = 'Pending'
+RETURNING CASE WHEN <spent> THEN 'Parked' ELSE 'Pending' END;
+
+-- End of a held message. The only way a message of such a kind becomes Parked or Expired.
+UPDATE app.outbox_messages
+   SET status = 'Parked',                         -- or 'Expired'
+       finished_at = @now, lease_token = NULL,
+       last_error = COALESCE(@error, last_error),
+       errors = CASE WHEN @error IS NULL THEN errors ELSE <errors with this entry appended> END
+ WHERE id = @id AND lease_token = @token AND status = 'Pending';
+```
+
+The end is sent first in a transaction with the hook, with a null `@error`. When the hook fails, it is sent again on its own with the hook's error. Zero rows means the lease was lost, as for any outcome.
 
 Every statement that records an error, the claim included, appends through the same expression, which keeps the most recent 20 entries:
 
@@ -426,7 +482,7 @@ For each kind:
 1. Wait until at least one concurrency slot is free.
 2. Claim up to that many messages.
 3. Start each on its own task and scope. On finish, write the outcome with no cancellation token and free the slot.
-4. If the claim returned as many messages as it asked for, go again as soon as a slot frees. Otherwise wait `PollInterval`, multiplied by a random factor between 0.8 and 1.2. Messages the claim parked or expired count towards what it returned; they are logged, never handled, and use no slot.
+4. If the claim returned as many messages as it asked for, go again as soon as a slot frees. Otherwise wait `PollInterval`, multiplied by a random factor between 0.8 and 1.2. Messages the claim parked or expired count towards what it returned; they are logged, never handled, and use no slot. For a kind with a give-up hook the claim holds them instead (9.7): each is ended on its own task, uses a slot until its end is written, and is logged then. It is not renewed, because once its end statement has run the row's lock keeps other claims away.
 5. If a claim fails because the database is unreachable or returns an error, log it and wait: `PollInterval` after the first failure, doubling after each one in a row, up to 30 seconds. The first claim that succeeds returns the loop to normal polling. Nothing is lost: claims expire on their own.
 
 The loop also runs the renewal (9.8). Claim and renewal are statements of the loop itself, one at a time, each in a short scope of its own, so a kind uses one connection for them besides its handlers. An outcome write that fails is logged and not retried; the message comes back after its lease as an abandoned attempt.
@@ -435,7 +491,7 @@ Because each kind has its own loop and its own limit, a slow kind cannot hold up
 
 On shutdown the loop stops claiming at once and keeps renewing. It waits up to `DrainTimeout` (default 20 seconds, inside the host's 30) for running handlers, then cancels their tokens and keeps waiting for them and their outcomes until the host's own shutdown time ends. An outcome a handler returned is always recorded. Anything still unfinished is recovered by lease expiry.
 
-The loop writes source-generated log messages when the database cannot be reached, when a lease is lost, when a handler throws, when an attempt times out, when the claim parks or expires a message, and when an outcome is refused or cannot be written. Each carries the message ID, kind and attempt where they exist. Error text in them has passed through `RedactError`.
+The loop writes source-generated log messages when the database cannot be reached, when a lease is lost, when a handler throws, when an attempt times out, when the claim parks or expires a message, when a give-up hook fails, and when an outcome is refused or cannot be written. Each carries the message ID, kind and attempt where they exist. Error text in them has passed through `RedactError`.
 
 All times come from `TimeProvider`. A lease must be much longer than the clock difference between instances. A clock difference can cause an early takeover and so a repeated send, which at-least-once already allows; the token still prevents a wrong write.
 
@@ -510,6 +566,7 @@ Meter `DurableOutbox`:
 | `durable_outbox.messages.enqueued` | Counter | `kind` |
 | `durable_outbox.attempts` | Counter | `kind`, `outcome` (`completed`, `retry`, `timed_out`, `rejected`, `parked`, `lease_lost`, `abandoned`) |
 | `durable_outbox.messages.expired` | Counter | `kind` |
+| `durable_outbox.give_up_hook.failures` | Counter | `kind` |
 | `durable_outbox.attempt.duration` | Histogram, seconds | `kind`, `outcome` |
 | `durable_outbox.messages.pending` | Gauge | `kind` |
 | `durable_outbox.messages.parked` | Gauge | `kind` |
@@ -517,9 +574,9 @@ Meter `DurableOutbox`:
 
 The meter comes from the container's `IMeterFactory` when it has one, as a generic host does; otherwise the library creates its own.
 
-`messages.enqueued` counts each message `AddAsync` inserts, when it inserts it. A duplicate is not counted, but a message whose transaction later rolls back is: counting at commit would need a hook into the caller's transaction. `messages.expired` counts each message a claim expires.
+`messages.enqueued` counts each message `AddAsync` inserts, when it inserts it. A duplicate is not counted, but a message whose transaction later rolls back is: counting at commit would need a hook into the caller's transaction. `messages.expired` counts each message whose expiry is stored: by the claim, or for a kind with a give-up hook by the end written after the claim held it. `give_up_hook.failures` counts each give-up hook that failed and left its message ended without it (9.5).
 
-`attempts` is counted by the worker that ran the attempt, once, by how it ended: `completed` when its completion stood; `retry` when its failure was recorded and the message is due again; `timed_out` when it ran past its timeout and was recorded as a retry that left attempts; `rejected` when its rejection stood; `parked` when its failure left no attempts; `lease_lost` when its lease was lost or its outcome refused. An attempt left with no outcome for another reason (the outcome could not be written, or the handler threw after the drain period) is not counted by its worker. A claim that finds an attempt that never reported counts it `abandoned`. So an attempt whose lease ran out while its worker was alive is counted twice: `lease_lost` by its worker and `abandoned` by the claim that took the message over. `attempt.duration` is recorded with each attempt the worker counts, from the start of the handler to the outcome being written, or to the handler's return when nothing was recorded.
+`attempts` is counted by the worker that ran the attempt, once, by how it ended: `completed` when its completion stood; `retry` when its failure was recorded and the message is due again; `timed_out` when it ran past its timeout and was recorded as a retry that left attempts; `rejected` when its rejection stood; `parked` when its failure left no attempts and, for a kind with a give-up hook, the end that followed stood, with or without the hook; `lease_lost` when its lease was lost or its outcome refused, the end of a held message included. An attempt left with no outcome for another reason (the outcome could not be written, or the handler threw after the drain period) is not counted by its worker. A claim that finds an attempt that never reported counts it `abandoned`. So an attempt whose lease ran out while its worker was alive is counted twice: `lease_lost` by its worker and `abandoned` by the claim that took the message over. `attempt.duration` is recorded with each attempt the worker counts, from the start of the handler to the outcome being written, or to the handler's return when nothing was recorded.
 
 The three gauges come from one statement, run every 15 seconds in each process that runs workers or registers the health check:
 
@@ -560,7 +617,7 @@ The library's own tests run against PostgreSQL in Testcontainers, with a fake `T
 | 4 | An attempt that never reports is claimed again after its lease, and parked after the attempt limit. |
 | 5 | A message that fails every attempt is parked with each error. An operator retry makes it claimable. |
 | Slow work | An attempt past its timeout is cancelled, recorded as a retry and its slot freed, including when the handler ignores the token. A kind with every slot held does not delay another kind. |
-| Other | Priority order, deadline expiry, backoff timing, `Done(record)` committing with the completion and rolling back when the lease is lost, drain on shutdown, recovery after the database restarts. |
+| Other | Priority order, deadline expiry, backoff timing, `Done(record)` committing with the completion and rolling back when the lease is lost, drain on shutdown, recovery after the database restarts. The give-up hook on each path that parks or expires, with its writes committed with the status; refused when the lease was lost; and a hook that throws. |
 
 `DurableOutbox.Testing` holds the guarantee tests as methods called against a `DbContext` and schema, with no dependency on a test framework. Version 1.0.0 of it was published for services to run against their own schema; later versions are not published (section 6, decision 12), and the kit is used by the library's own tests:
 
@@ -577,10 +634,11 @@ public sealed class OutboxContract<TContext> where TContext : DbContext
     public Task OneOwnerAtATimeAsync(CancellationToken cancellationToken = default);        // guarantee 3
     public Task CrashIsAnAttemptAsync(CancellationToken cancellationToken = default);       // guarantee 4
     public Task NeverDroppedAsync(CancellationToken cancellationToken = default);           // guarantee 5
+    public Task GiveUpHookAsync(CancellationToken cancellationToken = default);             // the give-up hook, 9.5
 }
 ```
 
-Each method builds its own service provider with the service's `DbContext`, a fake clock it moves itself, and handlers for kinds it generates for that call, so it never waits on real time and never touches the service's own messages. A method completes when its guarantee holds and throws `InvalidOperationException`, naming the guarantee and what differed, when it does not. The rows it wrote stay in the table, so the kit should be pointed at a database used only for tests. Guarantee 6 is a promise not made, so it has no method. The library's own tests prove guarantees 1 to 5 by calling these methods against two `DbContext` types with different schemas and table names, so there is one copy of each test.
+Each method builds its own service provider with the service's `DbContext`, a fake clock it moves itself, and handlers for kinds it generates for that call, so it never waits on real time and never touches the service's own messages. A method completes when its guarantee holds and throws `InvalidOperationException`, naming the guarantee and what differed, when it does not. The rows it wrote stay in the table, so the kit should be pointed at a database used only for tests. Guarantee 6 is a promise not made, so it has no method. `GiveUpHookAsync` is not a guarantee of 5.3 but runs under the same rules, because the hook depends on statements of its own: with a kind of its own whose hook queues a message, it checks that a message parked by a failed last attempt, one parked at the claim and one expired at the claim each commit that write with the status, and that a hook that throws leaves the message parked with the hook's error and without the write. The library's own tests prove guarantees 1 to 5 by calling these methods against two `DbContext` types with different schemas and table names, so there is one copy of each test.
 
 The kit also has `RunUntilIdleAsync`, for a service's integration tests:
 
@@ -603,6 +661,9 @@ It runs the handlers registered for `TContext`, with their options, until no mes
 - **Gauge sampling.** Every process that runs workers or registers the health check reads every pending and parked index entry of the table every 15 seconds (9.11). It is the same set of entries an idle claim reads, at a much lower rate, but a table with millions of waiting messages pays it in each such process.
 - **Counting inserts.** `durable_outbox.messages.enqueued` counts a message when `AddAsync` inserts it, so a transaction that rolls back afterwards still counts it.
 - **Cancel latency.** An operator cancel refuses the running attempt's outcome at once, but its handler is cancelled only at the next renewal, up to a third of the lease later.
+- **A held message that is never ended.** For a kind with a give-up hook, a message is held under a lease before it is ended (9.7, 9.8). If the worker dies, or the database fails, between the hold and the end, the next claim finds the message under a token and records it as an attempt that never reported: one more error entry and one more `abandoned` count, for a message whose attempt may have reported. There is no column to tell the two apart. The message is then held again and ended as usual.
+- **A give-up hook that fails.** The message is parked or expired without the hook's writes (9.5), so the service's record is not marked. The error log and `durable_outbox.give_up_hook.failures` say so. A parked message shows the hook's error in the operator list, and an operator retry gives it a new attempt and a new call to the hook. An expired message cannot be retried, so for those the service corrects its record from the log or the row.
+- **A slow give-up hook.** A held message uses one of its kind's slots until its end is written, so a slow hook holds up the kind's handlers as a slow handler would.
 - **Retry window after an operator retry.** An operator retry resets the attempts but not the creation time, so a message of a kind with a retry window that has passed gets exactly one attempt per retry (9.7).
 
 ### 9.14 Design decisions made
@@ -622,6 +683,11 @@ It runs the handlers registered for `TContext`, with their options, until no mes
 | 11 | The gauges are sampled every 15 seconds by one statement and read from memory. | A query inside the gauge callback would let the metrics collector decide the database load, and the health check would query on every probe. |
 | 12 | The start-up check gates the workers and retries an unreachable database instead of failing the start. | A table that does not match is a deployment error and must stop the host; a database that is briefly down is not, and the loop already survives it. |
 | 13 | The test kit depends on the exact same version of the library and on `Microsoft.Extensions.TimeProvider.Testing`. Since the kit is no longer packed (section 6, decision 12), the exact version is a project reference. | It runs the library's own claim and worker internals against the service's schema, and moves a fake clock as the library's tests do. |
+| 14 | For a kind with a give-up hook, the claim and the failed-attempt statement hold a spent or expired message under a lease instead of ending it, and the worker ends it in a transaction with the hook. A kind with no hook keeps its statements unchanged. | The claim is one statement with no surrounding transaction, so it cannot run the service's code with the status change. A hold is a claim like any other, so nothing new has to recover it. Running the existing failed-attempt statement inside a transaction would put a transaction around every failure of a kind with a retry window. |
+| 15 | A give-up hook that throws does not stop the message ending: it is parked or expired without the hook's writes, with the hook's error on the row, in the log and in a counter. | Calling the hook again until it works leaves a message with a broken hook claimable for ever and pending past its limit. Bounding the calls needs a counter, and there is no column for one without changing every service's table. Failures that pass on their own are the execution strategy's to retry. |
+| 16 | A held message uses one of its kind's slots until its end is written. | A full claim is followed by another at once, so hooks with no slot could pile up without limit and use the service's connection pool. |
+| 17 | `Reject` takes no record to commit with the rejection. | The handler decides to reject while it runs, so it can write its record before it returns, and a repeat of that is harmless. No caller needs the overload. It can be added later without breaking anything. |
+| 18 | The give-up hook is an interface on the kind's handler class, not an option. | The hook needs the scope's `DbContext`, which a handler class already gets by injection, and it keeps a kind's logic in one class. |
 
 ### 9.15 What is verified
 
@@ -648,6 +714,12 @@ Built and tested against PostgreSQL 17 (change `add-operations-and-release`):
 - The start-up check (9.11): a missing column or index is reported by name, an extra column of the service's is allowed, and nothing is claimed; a database unreachable at start-up delays the check without stopping it.
 - The test kit (9.12): guarantees 1 to 5 run as the kit's methods against `svc.outbox` and against a second context mapping `contract.messages`, beside a message of the service's own that they leave unchanged. With the claim's `FOR UPDATE SKIP LOCKED` removed, and separately with `lease_token = @token` removed from the completion, guarantee 3 fails for both contexts. `RunUntilIdleAsync` runs handlers with `RunWorkers` false and returns with a retried message left for later.
 - Both packages packed for 1.0.0 with the MIT licence, the readme and symbols, and the kit depended on exactly the same version of the library. From then on `dotnet pack` produces `DurableOutbox` alone.
+
+Built and tested against PostgreSQL 17 (change `add-give-up-hook`, version 1.1.0):
+
+- The give-up hook (9.5), by the test kit's `GiveUpHookAsync` against `svc.outbox` and `contract.messages`: a message parked by a failed last attempt, one parked at the claim after attempts that never reported, and one expired at the claim each store the hook's write with the status and get the right reason; a hook that throws leaves the message parked with the hook's error, without the write, and not claimable a day later. With the holding claim replaced by the plain one, the method fails for the message parked at the claim.
+- A held message cancelled by an operator before its end is not ended; the hook does not run when the last attempt's lease was taken over; the reason is `RetryWindowPassed` when the window has passed with attempts left, and changes the hook left tracked are saved; with two slots and five expired messages no more than two hooks run at once; a hook that throws is counted, logged, and its attempt counted `parked`.
+- `dotnet pack` of 1.1.0 passes package validation against the 1.0.0 baseline.
 
 Not yet verified: nothing has been run on PostgreSQL 14 to 16, and the GitHub Actions workflows have not run, because the repository has not been pushed. Their steps were run locally.
 

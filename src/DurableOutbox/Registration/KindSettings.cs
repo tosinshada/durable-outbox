@@ -10,7 +10,8 @@ internal sealed record KindSettings(
     int MaxAttempts,
     TimeSpan? RetryWindow,
     TimeSpan BackoffBase,
-    TimeSpan BackoffCap)
+    TimeSpan BackoffCap,
+    bool HasGiveUpHook)
 {
     public static KindSettings From(string kind, Type handlerType, OutboxKindOptions options)
     {
@@ -36,7 +37,8 @@ internal sealed record KindSettings(
 
         return new KindSettings(
             kind, handlerType, options.Lease, options.MaxConcurrency, options.AttemptTimeout, options.MaxAttempts,
-            options.RetryWindow, options.BackoffBase, options.BackoffCap);
+            options.RetryWindow, options.BackoffBase, options.BackoffCap,
+            typeof(IOutboxGiveUpHandler).IsAssignableFrom(handlerType));
     }
 
     private static void Positive(string kind, string option, TimeSpan value)

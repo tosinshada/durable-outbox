@@ -15,6 +15,7 @@ internal sealed class ContractHost<TContext> : IAsyncDisposable where TContext :
 {
     public static readonly TimeSpan Lease = TimeSpan.FromSeconds(60);
     public static readonly TimeSpan Step = TimeSpan.FromSeconds(1);
+    public const int GiveUpMaxAttempts = 2;
 
     private readonly ServiceProvider _services;
     private IHostedService[] _hosted = [];
@@ -26,13 +27,23 @@ internal sealed class ContractHost<TContext> : IAsyncDisposable where TContext :
         var suffix = Guid.NewGuid().ToString("N");
         Kind = $"durable-outbox.contract.{suffix}";
         OtherKind = $"durable-outbox.contract-other.{suffix}";
+        GiveUpKind = $"durable-outbox.contract-give-up.{suffix}";
+        Script.FollowUpKind = OtherKind;
 
         var services = new ServiceCollection();
         addDbContext(services);
         _services = services
             .AddSingleton<TimeProvider>(Time)
             .AddSingleton(Script)
-            .AddDurableOutbox<TContext>(outbox => outbox.AddHandler<ContractHandler>(Kind, kind => kind.Lease = Lease))
+            .AddDurableOutbox<TContext>(outbox =>
+            {
+                outbox.AddHandler<ContractHandler>(Kind, kind => kind.Lease = Lease);
+                outbox.AddHandler<ContractGiveUpHandler>(GiveUpKind, kind =>
+                {
+                    kind.Lease = Lease;
+                    kind.MaxAttempts = GiveUpMaxAttempts;
+                });
+            })
             .BuildServiceProvider();
     }
 
@@ -45,6 +56,9 @@ internal sealed class ContractHost<TContext> : IAsyncDisposable where TContext :
 
     /// <summary>A second kind of the contract's own, with no handler.</summary>
     public string OtherKind { get; }
+
+    /// <summary>A third kind of the contract's own, whose handler has a give-up hook and two attempts.</summary>
+    public string GiveUpKind { get; }
 
     public CancellationToken CancellationToken { get; }
 
@@ -77,28 +91,35 @@ internal sealed class ContractHost<TContext> : IAsyncDisposable where TContext :
     }
 
     /// <summary>Adds messages of <see cref="Kind"/> for each record in one committed transaction.</summary>
-    public Task AddAsync(params string[] recordRefs) => InScopeAsync(async scope =>
+    public Task AddAsync(params string[] recordRefs) =>
+        AddAsync([.. recordRefs.Select(recordRef => new OutboxMessage(Kind, recordRef))]);
+
+    /// <summary>Adds the messages in one committed transaction.</summary>
+    public Task AddAsync(params OutboxMessage[] messages) => InScopeAsync(async scope =>
     {
         var context = scope.GetRequiredService<TContext>();
         var outbox = scope.GetRequiredService<IOutbox>();
         await using var transaction = await context.Database.BeginTransactionAsync(CancellationToken);
-        foreach (var recordRef in recordRefs)
+        foreach (var message in messages)
         {
-            await outbox.AddAsync(new OutboxMessage(Kind, recordRef), CancellationToken);
+            await outbox.AddAsync(message, CancellationToken);
         }
 
         await transaction.CommitAsync(CancellationToken);
         return true;
     });
 
-    public Task<ClaimBatch> ClaimAsync(int limit = 10, int maxAttempts = 10) =>
-        InScopeAsync(scope => Store(scope).ClaimAsync(Kind, limit, Lease, maxAttempts, null, CancellationToken));
+    public Task<ClaimBatch> ClaimAsync(int limit = 10, int maxAttempts = 10) => ClaimAsync(Kind, limit, maxAttempts);
+
+    /// <summary>Claims as a kind with no give-up hook does.</summary>
+    public Task<ClaimBatch> ClaimAsync(string kind, int limit = 10, int maxAttempts = 10) =>
+        InScopeAsync(scope => Store(scope).ClaimAsync(kind, limit, Lease, maxAttempts, null, hold: false, CancellationToken));
 
     public Task<bool> CompleteAsync(Guid id, Guid token) =>
         InScopeAsync(scope => Store(scope).CompleteAsync(id, token, CancellationToken));
 
     public Task<FailOutcome> FailAsync(Guid id, Guid token, string error, int maxAttempts = 10) =>
-        InScopeAsync(scope => Store(scope).FailAsync(id, token, error, Time.GetUtcNow(), maxAttempts, null, CancellationToken));
+        InScopeAsync(scope => Store(scope).FailAsync(id, token, error, Time.GetUtcNow(), maxAttempts, null, holdFor: null, CancellationToken));
 
     public Task<bool> RejectAsync(Guid id, Guid token, string reason) =>
         InScopeAsync(scope => Store(scope).RejectAsync(id, token, reason, CancellationToken));
@@ -106,7 +127,7 @@ internal sealed class ContractHost<TContext> : IAsyncDisposable where TContext :
     /// <summary>The rows of this call's kinds, and no others.</summary>
     public Task<List<OutboxMessageRow>> RowsAsync() => InScopeAsync(scope =>
         scope.GetRequiredService<TContext>().Set<OutboxMessageRow>().AsNoTracking()
-            .Where(row => row.Kind == Kind || row.Kind == OtherKind)
+            .Where(row => row.Kind == Kind || row.Kind == OtherKind || row.Kind == GiveUpKind)
             .ToListAsync(CancellationToken));
 
     public static (int Attempt, string Error)[] Errors(OutboxMessageRow row)

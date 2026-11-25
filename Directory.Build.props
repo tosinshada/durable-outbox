@@ -10,8 +10,8 @@
   <!-- Package metadata. Projects that ship set IsPackable; nothing else packs. -->
   <PropertyGroup>
     <IsPackable>false</IsPackable>
-    <!-- The release version. A prerelease adds a label at pack time: -p:VersionSuffix=rc.1 gives 1.0.0-rc.1. -->
-    <VersionPrefix>1.0.0</VersionPrefix>
+    <!-- The release version. A prerelease adds a label at pack time: -p:VersionSuffix=rc.1 gives 1.1.0-rc.1. -->
+    <VersionPrefix>1.1.0</VersionPrefix>
     <Authors>Tosin Shada</Authors>
     <Copyright>Copyright (c) 2026 Tosin Shada</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

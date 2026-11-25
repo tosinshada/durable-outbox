@@ -11,4 +11,10 @@ internal enum FailOutcome
 
     /// <summary>The attempts or the retry window were used up.</summary>
     Parked,
+
+    /// <summary>
+    /// The attempts or the retry window were used up, and the kind has a give-up hook: the message is still
+    /// pending under the attempt's token, held for the worker to end it with the hook.
+    /// </summary>
+    Held,
 }

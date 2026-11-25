@@ -35,7 +35,12 @@ public sealed class ShutdownTests(PostgresFixture postgres) : WorkerTestBase(pos
         var call = await Handler.CallAsync(0);
 
         var stoppedAt = Time.GetUtcNow();
-        await AdvanceUntilAsync(StopWorkersAsync(), Step);
+        var stopping = StopWorkersAsync();
+
+        // Only the end of the drain period waits on the clock. The handler returning and the stop finishing
+        // after that do not, so they are awaited rather than stepped through.
+        await AdvanceUntilAsync(call.Cancelled, Step);
+        await stopping;
 
         Assert.InRange(await call.Cancelled - stoppedAt, DrainTimeout, DrainTimeout + Step);
         var row = await RowAsync();

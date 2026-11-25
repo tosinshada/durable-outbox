@@ -125,7 +125,7 @@ Two choices were made while proposing this change: the retry window applies only
 - The start-up check fails on a table with a missing column or index.
 - The kit's contract tests pass against a second `DbContext` with a different schema and table name.
 
-Publishing to nuget.org is a separate, manual step after this change is archived. It needs the owner's approval, and the one-time setup in the README's release section.
+Publishing to nuget.org is a separate, manual step after this change is archived. It needs the owner's approval, and the one-time setup in `docs/releasing.md`.
 
 ## After version 1
 

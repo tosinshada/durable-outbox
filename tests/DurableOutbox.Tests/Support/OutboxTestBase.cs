@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Time.Testing;
+using Npgsql;
 using Xunit;
 
 namespace DurableOutbox.Tests;
@@ -36,7 +37,16 @@ public abstract class OutboxTestBase(PostgresFixture postgres) : IAsyncLifetime
         await InScopeAsync(scope => scope.GetRequiredService<TestDbContext>().Database.MigrateAsync(Ct));
     }
 
-    public virtual async ValueTask DisposeAsync() => await _services.DisposeAsync();
+    public virtual async ValueTask DisposeAsync()
+    {
+        await _services.DisposeAsync();
+
+        // Each test has its own database, so Npgsql keeps a pool for it. Unless it is cleared, its idle
+        // connections stay open for the rest of the run, and across the run they reach PostgreSQL's
+        // connection limit.
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        NpgsqlConnection.ClearPool(connection);
+    }
 
     /// <summary>A singleton of the container the helpers here use, such as its <see cref="OutboxMetrics"/>.</summary>
     private protected T Service<T>() where T : notnull => _services.GetRequiredService<T>();

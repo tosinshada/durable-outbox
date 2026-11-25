@@ -26,7 +26,12 @@ internal sealed class WorkerClock(FakeTimeProvider time, Func<Task> idle, Cancel
 
     public Task IdleAsync() => idle().WaitAsync(cancellationToken);
 
-    /// <summary>Moves the clock in steps, each once the workers are idle, until <paramref name="signal"/> completes.</summary>
+    /// <summary>
+    /// Moves the clock in steps, each once the workers are idle, until <paramref name="signal"/> completes.
+    /// The signal must be something the clock brings about. Idle workers still move without it when a handler
+    /// returns or the host stops, and the steps run in a few milliseconds of real time, so a signal that waits
+    /// on that work can run out of steps first: await such work after the clock's part is done.
+    /// </summary>
     public async Task AdvanceUntilAsync(Task signal, TimeSpan step)
     {
         for (var steps = 0; !signal.IsCompleted; steps++)

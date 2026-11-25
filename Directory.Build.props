@@ -20,6 +20,8 @@
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <EnablePackageValidation>true</EnablePackageValidation>
+    <!-- The last stable release on nuget.org. Pack fails if the public API has lost or changed anything it had. -->
+    <PackageValidationBaselineVersion>1.0.0</PackageValidationBaselineVersion>
     <RepositoryUrl>https://github.com/tosinshada/durable-outbox</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageProjectUrl>https://github.com/tosinshada/durable-outbox</PackageProjectUrl>

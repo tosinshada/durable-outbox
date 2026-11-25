@@ -2,9 +2,9 @@
 
 | | |
 | :--- | :--- |
-| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Both packages build with `dotnet pack`. Nothing is published. Section 9.15 has the detail. |
-| Date | 2026-11-23 |
-| Next step | Push the repository, let the pipeline run once, and publish 1.0.0 with the owner's approval (the release steps in `docs/releasing.md`). |
+| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Version 1.0.0 of both packages is published on nuget.org, and later packs are checked against it for breaking changes. Section 9.15 has the detail. |
+| Date | 2026-11-25 |
+| Next step | None set. Later work (section 5.5) goes through OpenSpec and is released by the steps in `docs/releasing.md`. |
 
 ## 1. Summary
 

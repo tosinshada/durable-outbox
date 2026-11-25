@@ -1,9 +1,15 @@
 # Publishes both packages to nuget.org. Runs only when started by hand, and only after the owner approves the
 # `nuget` environment. Signs in with nuget.org Trusted Publishing, so no API key is stored. Creates no tag.
+# The version is VersionPrefix in Directory.Build.props. A prerelease label, if given, is added after it.
 name: Publish
 
 on:
   workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Prerelease label, such as rc.1 (gives 1.0.0-rc.1). Leave empty for a stable release.'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -15,7 +21,18 @@ jobs:
     permissions:
       contents: read
       id-token: write   # for the short-lived nuget.org key
+    env:
+      PRERELEASE: ${{ inputs.prerelease }}
     steps:
+      # A SemVer prerelease label: dot-separated parts of letters, digits and hyphens.
+      - name: Check prerelease label
+        if: env.PRERELEASE != ''
+        run: |
+          if ! [[ "$PRERELEASE" =~ ^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$ ]]; then
+            echo "::error::'$PRERELEASE' is not a SemVer prerelease label, such as rc.1"
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-dotnet@v6
@@ -23,13 +40,13 @@ jobs:
           global-json-file: global.json
 
       - name: Build
-        run: dotnet build -c Release
+        run: dotnet build -c Release -p:VersionSuffix="$PRERELEASE"
 
       - name: Test
         run: dotnet test -c Release --no-build
 
       - name: Pack
-        run: dotnet pack -c Release --no-build -o artifacts
+        run: dotnet pack -c Release --no-build -o artifacts -p:VersionSuffix="$PRERELEASE"
 
       - name: Sign in to nuget.org
         id: login

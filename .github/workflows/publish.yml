@@ -1,4 +1,4 @@
-# Publishes both packages to nuget.org. Runs only when started by hand, and only after the owner approves the
+# Publishes the DurableOutbox package to nuget.org (DurableOutbox.Testing is not packed). Runs only when started by hand, and only after the owner approves the
 # `nuget` environment. Signs in with nuget.org Trusted Publishing, so no API key is stored. Creates no tag.
 # The version is VersionPrefix in Directory.Build.props. A prerelease label, if given, is added after it.
 name: Publish

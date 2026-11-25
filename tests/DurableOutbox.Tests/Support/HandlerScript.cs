@@ -5,9 +5,25 @@ public sealed class HandlerScript
 {
     private readonly Lock _gate = new();
     private readonly List<HandlerCall> _calls = [];
+    private readonly List<(OutboxDelivery Delivery, OutboxGiveUpReason Reason)> _giveUps = [];
     private readonly List<(int Index, TaskCompletionSource<HandlerCall> Signal)> _waiting = [];
 
     public Func<HandlerCall, Task<OutboxResult>> Behaviour { get; set; } = _ => Task.FromResult(OutboxResult.Done());
+
+    /// <summary>What <see cref="GiveUpTestHandler"/>'s hook does. It is given the hook scope's context.</summary>
+    public Func<TestDbContext, OutboxDelivery, CancellationToken, Task> OnGiveUp { get; set; } = (_, _, _) => Task.CompletedTask;
+
+    /// <summary>Every call <see cref="GiveUpTestHandler"/>'s hook received.</summary>
+    public IReadOnlyList<(OutboxDelivery Delivery, OutboxGiveUpReason Reason)> GiveUps
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return [.. _giveUps];
+            }
+        }
+    }
 
     public IReadOnlyList<HandlerCall> Calls
     {
@@ -33,6 +49,14 @@ public sealed class HandlerScript
             var signal = new TaskCompletionSource<HandlerCall>(TaskCreationOptions.RunContinuationsAsynchronously);
             _waiting.Add((index, signal));
             return signal.Task;
+        }
+    }
+
+    internal void RecordGiveUp(OutboxDelivery delivery, OutboxGiveUpReason reason)
+    {
+        lock (_gate)
+        {
+            _giveUps.Add((delivery, reason));
         }
     }
 

@@ -142,6 +142,113 @@ public sealed class OutboxContract<TContext> where TContext : DbContext
         Expect.Sequence(5, errors, ContractHost<TContext>.Errors((await host.RowsAsync()).Single()), "error history after an operator retry");
     }
 
+    /// <summary>
+    /// The give-up hook (section 9.5): on every path that parks or expires a message, a write the hook makes
+    /// commits with the new status, and a hook that throws leaves the message parked with the hook's error and
+    /// without that write.
+    /// </summary>
+    public async Task GiveUpHookAsync(CancellationToken cancellationToken = default)
+    {
+        await ParkedByAFailedAttemptAsync(hookThrows: false, cancellationToken);
+        await ParkedAtTheClaimAsync(cancellationToken);
+        await ExpiredAtTheClaimAsync(cancellationToken);
+        await ParkedByAFailedAttemptAsync(hookThrows: true, cancellationToken);
+    }
+
+    private async Task ParkedByAFailedAttemptAsync(bool hookThrows, CancellationToken cancellationToken)
+    {
+        const int attempts = ContractHost<TContext>.GiveUpMaxAttempts;
+        await using var host = Host(cancellationToken);
+        host.Script.HookThrows = hookThrows;
+        host.Script.Behaviour = _ => Task.FromResult(OutboxResult.Retry("receiver down"));
+        await host.AddAsync(new OutboxMessage(host.GiveUpKind, "order-1"));
+        await host.StartWorkersAsync();
+
+        var row = await EndedAsync(host);
+        var when = hookThrows ? "when the hook threw" : "after the last attempt failed";
+        Expect.Equal(Expect.GiveUpHook, OutboxStatus.Parked, row.Status, $"status {when}");
+        Expect.Equal(Expect.GiveUpHook, null, row.LeaseToken, $"lease token of the parked message {when}");
+        Expect.Equal(Expect.GiveUpHook, attempts, host.Script.Calls.Count, "attempts handled before the message was parked");
+
+        var errors = ContractHost<TContext>.Errors(row);
+        if (hookThrows)
+        {
+            Expect.Sequence(Expect.GiveUpHook, [1, 2, 2], errors.Select(error => error.Attempt), "attempts in the error history when the hook threw");
+            Expect.That(Expect.GiveUpHook,
+                row.LastError is { } last
+                    && last.StartsWith(ErrorText.GiveUpHookFailed, StringComparison.Ordinal)
+                    && last.Contains(ContractGiveUpHandler.HookError, StringComparison.Ordinal),
+                $"the last error of message {row.Id} is not the hook's failure: {row.LastError}");
+            Expect.Sequence(Expect.GiveUpHook, [], await FollowUpsAsync(host), $"writes stored from the hook of message {row.Id}, which threw");
+
+            host.Time.Advance(TimeSpan.FromDays(1));
+            Expect.Equal(Expect.GiveUpHook, 0, (await host.ClaimAsync(host.GiveUpKind, maxAttempts: attempts)).Messages.Count,
+                "claims of the message a day after its hook threw");
+        }
+        else
+        {
+            Expect.Sequence(Expect.GiveUpHook, [(1, "receiver down"), (2, "receiver down")], errors, "error history after the last attempt failed");
+            Expect.Sequence(Expect.GiveUpHook, [$"order-1:{OutboxGiveUpReason.AttemptsUsedUp}:{attempts}"], await FollowUpsAsync(host),
+                $"writes stored from the hook of message {row.Id}, parked by a failed attempt");
+        }
+    }
+
+    private async Task ParkedAtTheClaimAsync(CancellationToken cancellationToken)
+    {
+        const int attempts = ContractHost<TContext>.GiveUpMaxAttempts;
+        await using var host = Host(cancellationToken);
+        await host.AddAsync(new OutboxMessage(host.GiveUpKind, "order-1"));
+
+        // Every allowed attempt is claimed and never reports.
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            Expect.Equal(Expect.GiveUpHook, 1, (await host.ClaimAsync(host.GiveUpKind, maxAttempts: attempts)).Messages.Count,
+                $"messages claimed for attempt {attempt}");
+            host.Time.Advance(ContractHost<TContext>.Lease);
+        }
+
+        await host.StartWorkersAsync();
+        var row = await EndedAsync(host);
+
+        Expect.Equal(Expect.GiveUpHook, OutboxStatus.Parked, row.Status, "status after the last attempt never reported");
+        Expect.Equal(Expect.GiveUpHook, attempts, row.Attempts, "attempts of the message parked at the claim");
+        Expect.Equal(Expect.GiveUpHook, 0, host.Script.Calls.Count, "handler calls for a message with no attempts left");
+        Expect.Sequence(Expect.GiveUpHook, [1, 2], ContractHost<TContext>.Errors(row).Select(error => error.Attempt),
+            "abandoned attempts in the error history");
+        Expect.Sequence(Expect.GiveUpHook, [$"order-1:{OutboxGiveUpReason.AttemptsUsedUp}:{attempts}"], await FollowUpsAsync(host),
+            $"writes stored from the hook of message {row.Id}, parked at the claim");
+    }
+
+    private async Task ExpiredAtTheClaimAsync(CancellationToken cancellationToken)
+    {
+        await using var host = Host(cancellationToken);
+        await host.AddAsync(new OutboxMessage(host.GiveUpKind, "order-1") { Deadline = host.Time.GetUtcNow() + TimeSpan.FromMinutes(1) });
+        host.Time.Advance(TimeSpan.FromMinutes(2));
+
+        await host.StartWorkersAsync();
+        var row = await EndedAsync(host);
+
+        Expect.Equal(Expect.GiveUpHook, OutboxStatus.Expired, row.Status, "status after the deadline passed");
+        Expect.Equal(Expect.GiveUpHook, 0, row.Attempts, "attempts of the message expired at the claim");
+        Expect.Equal(Expect.GiveUpHook, 0, host.Script.Calls.Count, "handler calls for a message past its deadline");
+        Expect.Sequence(Expect.GiveUpHook, [$"order-1:{OutboxGiveUpReason.DeadlinePassed}:0"], await FollowUpsAsync(host),
+            $"writes stored from the hook of message {row.Id}, expired at the claim");
+    }
+
+    /// <summary>Moves the clock until the one message of the give-up kind is no longer pending, stops the workers and returns it.</summary>
+    private static async Task<OutboxMessageRow> EndedAsync(ContractHost<TContext> host)
+    {
+        await host.Clock.AdvanceUntilAsync(
+            async () => (await host.RowsAsync()).Single(row => row.Kind == host.GiveUpKind).Status != OutboxStatus.Pending,
+            ContractHost<TContext>.Step);
+        await host.StopWorkersAsync();
+        return (await host.RowsAsync()).Single(row => row.Kind == host.GiveUpKind);
+    }
+
+    /// <summary>The record references of the messages the hook queued, which stand for a service's own writes.</summary>
+    private static async Task<string[]> FollowUpsAsync(ContractHost<TContext> host) =>
+        [.. (await host.RowsAsync()).Where(row => row.Kind == host.OtherKind).Select(row => row.RecordRef)];
+
     private async Task DuplicateIsIgnoredAsync(CancellationToken cancellationToken)
     {
         await using var host = Host(cancellationToken);

@@ -1,6 +1,6 @@
 # Releasing
 
-Packages are built, tested and packed by `.github/workflows/ci.yml` on every push and pull request. Publishing to nuget.org is a separate workflow, `.github/workflows/publish.yml`, that runs only when started by hand and only after approval. It signs in with [nuget.org Trusted Publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing), so no API key is stored.
+The `DurableOutbox` package is built, tested and packed by `.github/workflows/ci.yml` on every push to `main`. It is the only package published: `DurableOutbox.Testing` is the repository's own test kit and is not packed. Publishing to nuget.org is a separate workflow, `.github/workflows/publish.yml`, that runs only when started by hand and only after approval. It signs in with [nuget.org Trusted Publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing), so no API key is stored.
 
 ## One-time setup
 
@@ -20,22 +20,19 @@ The packages follow [Semantic Versioning 2.0.0](https://semver.org) (SemVer), wh
 
 A prerelease adds a label after a hyphen, such as `1.1.0-rc.1`. NuGet does not install a prerelease unless asked to, and sorts it before the stable version with the same number.
 
-`VersionPrefix` in `Directory.Build.props` holds the `MAJOR.MINOR.PATCH` part. The prerelease label is not stored there: it is given when the package is built (`dotnet pack -p:VersionSuffix=rc.1`). Both packages always share one version, and the test kit depends on exactly that version of the library.
+`VersionPrefix` in `Directory.Build.props` holds the `MAJOR.MINOR.PATCH` part. The prerelease label is not stored there: it is given when the package is built (`dotnet pack -p:VersionSuffix=rc.1`).
 
 ## Each release
 
 1. Set `VersionPrefix` in `Directory.Build.props` to the next version, by the rules above, and merge.
 2. Start the publish workflow by hand. For a prerelease, enter its label (such as `rc.1`) in the `prerelease` box; leave the box empty for a stable release. The workflow rejects a label that is not valid SemVer.
 3. Approve the `nuget` environment when asked.
+4. After a stable release, set `PackageValidationBaselineVersion` in `Directory.Build.props` to it (see below).
 
 The workflow creates no tag.
 
 ## Checking for breaking changes
 
-`EnablePackageValidation` is on in `Directory.Build.props`. Once a stable version is on nuget.org, set `PackageValidationBaselineVersion` beside it to the last stable version, for example:
+`EnablePackageValidation` is on in `Directory.Build.props`, with `PackageValidationBaselineVersion` set to the last stable version on nuget.org (now `1.0.0`). `dotnet pack` downloads that version and fails if the public API has lost or changed anything it had, so a breaking change cannot ship by mistake.
 
-```xml
-<PackageValidationBaselineVersion>1.0.0</PackageValidationBaselineVersion>
-```
-
-`dotnet pack` then downloads that version and fails if the public API has lost or changed anything it had, so a breaking change cannot ship by mistake. When the break is intended, raise the major version and move the baseline to the last stable version after release. Leave the property out until 1.0.0 is published: pack fails when the baseline cannot be downloaded.
+When a break is intended, raise the major version and tell package validation the break is expected, either by suppressing the specific errors or by leaving out the baseline for that one release. After each stable release, move `PackageValidationBaselineVersion` to that release, so the next one is checked against it. A prerelease is never the baseline.

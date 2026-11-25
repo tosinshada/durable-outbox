@@ -26,6 +26,10 @@ public abstract class ContractTests<TContext>(PostgresFixture postgres) : Outbox
     [Fact]
     public Task Guarantee_5_never_dropped() => RunAsync(contract => contract.NeverDroppedAsync(Ct));
 
+    // Section 9.5: the hook's writes commit with the status on every path that parks or expires.
+    [Fact]
+    public Task The_give_up_hook_commits_with_the_status() => RunAsync(contract => contract.GiveUpHookAsync(Ct));
+
     /// <summary>Runs one guarantee method against the test's database.</summary>
     protected virtual Task RunAsync(Func<OutboxContract<TContext>, Task> guarantee) =>
         guarantee(new OutboxContract<TContext>(services =>

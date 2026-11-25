@@ -81,8 +81,8 @@ public abstract class OutboxTestBase(PostgresFixture postgres) : IAsyncLifetime
     });
 
     private protected Task<ClaimBatch> ClaimAsync(
-        string kind = Kind, int limit = 10, int maxAttempts = 10, TimeSpan? retryWindow = null) =>
-        InScopeAsync(scope => Store(scope).ClaimAsync(kind, limit, Lease, maxAttempts, retryWindow, Ct));
+        string kind = Kind, int limit = 10, int maxAttempts = 10, TimeSpan? retryWindow = null, bool hold = false) =>
+        InScopeAsync(scope => Store(scope).ClaimAsync(kind, limit, Lease, maxAttempts, retryWindow, hold, Ct));
 
     /// <summary>Claims the one message that is due and returns it with its token.</summary>
     private protected async Task<(ClaimedMessage Message, Guid Token)> ClaimOneAsync(int maxAttempts = 10)
@@ -97,7 +97,7 @@ public abstract class OutboxTestBase(PostgresFixture postgres) : IAsyncLifetime
     /// <summary>Reports a failed attempt, to be retried after <paramref name="delay"/>.</summary>
     private protected Task<FailOutcome> FailAsync(
         Guid id, Guid token, string error, TimeSpan delay = default, int maxAttempts = 10, TimeSpan? retryWindow = null) =>
-        InScopeAsync(scope => Store(scope).FailAsync(id, token, error, Time.GetUtcNow() + delay, maxAttempts, retryWindow, Ct));
+        InScopeAsync(scope => Store(scope).FailAsync(id, token, error, Time.GetUtcNow() + delay, maxAttempts, retryWindow, holdFor: null, Ct));
 
     private protected Task<bool> RejectAsync(Guid id, Guid token, string reason) =>
         InScopeAsync(scope => Store(scope).RejectAsync(id, token, reason, Ct));

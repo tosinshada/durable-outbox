@@ -56,6 +56,34 @@ internal sealed class OutboxSql
                       due.abandoned AS "Abandoned"
             """;
 
+        ClaimHolding = $"""
+            WITH due AS MATERIALIZED (
+                SELECT id,
+                       CASE
+                           WHEN deadline_at <= @now THEN 'Expired'
+                           WHEN {Spent} THEN 'Parked'
+                           ELSE 'Pending'
+                       END AS verdict,
+                       lease_token IS NOT NULL AS abandoned
+                  FROM {table}
+                 WHERE status = 'Pending' AND kind = @kind AND next_attempt_at <= @now
+                 ORDER BY priority DESC, next_attempt_at
+                 LIMIT @limit
+                   FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {table} m
+               SET attempts        = m.attempts + (due.verdict = 'Pending')::int,
+                   lease_token     = @token,
+                   next_attempt_at = @now + @lease,
+                   last_error      = CASE WHEN due.abandoned THEN @error ELSE m.last_error END,
+                   errors          = CASE WHEN due.abandoned THEN {AppendError("m.")} ELSE m.errors END
+              FROM due
+             WHERE m.id = due.id
+            RETURNING m.id AS "Id", m.record_ref AS "RecordRef", due.verdict AS "Status", m.attempts AS "Attempt",
+                      m.created_at AS "CreatedAt", m.deadline_at AS "Deadline", m.trace_parent AS "TraceParent",
+                      due.abandoned AS "Abandoned"
+            """;
+
         Complete = $"""
             UPDATE {table}
                SET status = 'Completed', finished_at = @now, lease_token = NULL
@@ -73,6 +101,19 @@ internal sealed class OutboxSql
              WHERE id = @id AND lease_token = @token AND status = 'Pending'
             RETURNING status AS "Value"
             """;
+
+        FailHolding = $"""
+            UPDATE {table}
+               SET next_attempt_at = CASE WHEN {Spent} THEN @now + @lease ELSE @next END,
+                   lease_token     = CASE WHEN {Spent} THEN lease_token END,
+                   last_error      = @error,
+                   errors          = {AppendError("")}
+             WHERE id = @id AND lease_token = @token AND status = 'Pending'
+            RETURNING CASE WHEN {Spent} THEN 'Parked' ELSE 'Pending' END AS "Value"
+            """;
+
+        EndParked = End(table, OutboxStatus.Parked);
+        EndExpired = End(table, OutboxStatus.Expired);
 
         Reject = $"""
             UPDATE {table}
@@ -126,8 +167,29 @@ internal sealed class OutboxSql
 
     public string Insert { get; }
     public string Claim { get; }
+
+    /// <summary>
+    /// The claim for a kind with a give-up hook. The same statement as <see cref="Claim"/>, except that a row
+    /// whose verdict is <c>Parked</c> or <c>Expired</c> is not ended: it stays pending under the claim's token
+    /// and lease, with no attempt counted, and the verdict is returned as its status for the worker to end it.
+    /// </summary>
+    public string ClaimHolding { get; }
+
     public string Complete { get; }
     public string Fail { get; }
+
+    /// <summary>
+    /// The failed attempt for a kind with a give-up hook. It records the error and chooses as <see cref="Fail"/>
+    /// does, but a spent row is not parked: it stays pending under the attempt's token for a full lease, and
+    /// <c>Parked</c> is returned as the verdict for the worker to end it.
+    /// </summary>
+    public string FailHolding { get; }
+
+    /// <summary>Ends a held message as <c>Parked</c>, fenced. A non-null <c>@error</c> is recorded with it.</summary>
+    public string EndParked { get; }
+
+    /// <summary>Ends a held message as <c>Expired</c>, fenced. A non-null <c>@error</c> is recorded with it.</summary>
+    public string EndExpired { get; }
     public string Reject { get; }
 
     /// <summary>
@@ -160,6 +222,14 @@ internal sealed class OutboxSql
                {(afterEntry ? "AND (finished_at, id) < (@after_finished_at, @after_id)" : "")}
          ORDER BY finished_at DESC, id DESC
          LIMIT @limit
+        """;
+
+    private static string End(string table, string status) => $"""
+        UPDATE {table}
+           SET status = '{status}', finished_at = @now, lease_token = NULL,
+               last_error = COALESCE(@error, last_error),
+               errors = CASE WHEN @error IS NULL THEN errors ELSE {AppendError("")} END
+         WHERE id = @id AND lease_token = @token AND status = 'Pending'
         """;
 
     /// <summary>

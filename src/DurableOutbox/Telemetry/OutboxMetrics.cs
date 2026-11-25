@@ -16,6 +16,7 @@ internal sealed class OutboxMetrics : IDisposable
     private readonly Counter<long> _enqueued;
     private readonly Counter<long> _attempts;
     private readonly Counter<long> _expired;
+    private readonly Counter<long> _giveUpHookFailures;
     private readonly Histogram<double> _duration;
     private readonly Lock _gate = new();
     private readonly List<Func<OutboxSample?>> _samples = [];
@@ -30,7 +31,9 @@ internal sealed class OutboxMetrics : IDisposable
         _attempts = _meter.CreateCounter<long>(
             "durable_outbox.attempts", description: "Attempts, by how they ended.");
         _expired = _meter.CreateCounter<long>(
-            "durable_outbox.messages.expired", description: "Messages whose deadline passed before they were attempted.");
+            "durable_outbox.messages.expired", description: "Messages expired because their deadline passed.");
+        _giveUpHookFailures = _meter.CreateCounter<long>(
+            "durable_outbox.give_up_hook.failures", description: "Give-up hooks that failed, leaving the message ended without them.");
         _duration = _meter.CreateHistogram<double>(
             "durable_outbox.attempt.duration", unit: "s", description: "How long an attempt took, from its handler's start to its outcome.");
 
@@ -49,6 +52,8 @@ internal sealed class OutboxMetrics : IDisposable
     public void Enqueued(string kind) => _enqueued.Add(1, Kind(kind));
 
     public void Expired(string kind) => _expired.Add(1, Kind(kind));
+
+    public void GiveUpHookFailed(string kind) => _giveUpHookFailures.Add(1, Kind(kind));
 
     public void Abandoned(string kind) =>
         _attempts.Add(1, new TagList { { "kind", kind }, { "outcome", AttemptOutcome.Abandoned } });

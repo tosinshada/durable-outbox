@@ -34,11 +34,15 @@ A kind whose slots are all held SHALL NOT delay the claiming or handling of anot
 - **THEN** the `invoice.file` message is handled and completed while the `receipt.send` handlers are still running
 
 ### Requirement: Messages ended by the claim are not handled
-A message the claim parks or expires SHALL NOT be handed to a handler and SHALL NOT use a slot. It SHALL be logged with its ID, kind and new status.
+A message the claim parks or expires SHALL NOT be handed to a handler's `HandleAsync`. For a kind with no give-up hook it SHALL NOT use a slot. For a kind with a give-up hook, the message is held by the claim and SHALL use one of the kind's slots until its end is written. Either way it SHALL be logged with its ID, kind and new status once that status is stored.
 
 #### Scenario: Message past its deadline
 - **WHEN** a message's deadline passes before the loop claims it
 - **THEN** the handler is never called for it and the message is `Expired`
+
+#### Scenario: Held messages respect the concurrency limit
+- **WHEN** a kind with a give-up hook has `MaxConcurrency` 2 and five messages past their deadline are due
+- **THEN** at most two hooks run at the same time
 
 ### Requirement: The loop survives the database being unreachable
 When a claim or a renewal fails because the database cannot be reached or returns an error, the loop SHALL log the error and keep running. It SHALL wait before the next claim, starting at `PollInterval` and doubling after each consecutive failure up to 30 seconds, and SHALL return to normal polling after the first claim that succeeds. No message SHALL be lost: a claim that was made but not reported is recovered by its lease.

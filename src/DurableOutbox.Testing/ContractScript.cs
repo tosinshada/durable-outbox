@@ -9,6 +9,12 @@ internal sealed class ContractScript
 
     public Func<ContractCall, Task<OutboxResult>> Behaviour { get; set; } = _ => Task.FromResult(OutboxResult.Done());
 
+    /// <summary>The kind <see cref="ContractGiveUpHandler"/>'s hook queues its follow-up message under.</summary>
+    public string FollowUpKind { get; set; } = "";
+
+    /// <summary>Whether <see cref="ContractGiveUpHandler"/>'s hook throws after its write.</summary>
+    public bool HookThrows { get; set; }
+
     public IReadOnlyList<ContractCall> Calls
     {
         get

@@ -5,6 +5,7 @@ internal static class ErrorText
 {
     public const int MaxLength = 2000;
     public const string TimedOut = "timed out";
+    public const string GiveUpHookFailed = "The give-up hook failed: ";
     public const string CouldNotRedact = "The error text could not be redacted.";
 
     public static string From(string text, Func<string, string> redact)

@@ -22,6 +22,9 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
     private readonly Task _schemaChecked;
     private readonly OutboxMetrics _metrics;
 
+    /// <summary>Cancelled when the drain period ends. The token a give-up hook is given.</summary>
+    private readonly CancellationTokenSource _drainEnded = new();
+
     private readonly Lock _gate = new();
     private readonly HashSet<Attempt> _running = [];
     private TaskCompletionSource _wake = NewSignal();
@@ -101,6 +104,9 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
                 _finished = true;
                 UpdateIdle();
             }
+
+            // Nothing is running any more, so no hook still holds the token.
+            _drainEnded.Dispose();
         }
     }
 
@@ -177,6 +183,7 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
             if (!cancelled && now >= drainEnd)
             {
                 cancelled = true;
+                await _drainEnded.CancelAsync();
                 foreach (var attempt in running)
                 {
                     TryCancel(attempt, CancelReason.DrainEnded, whileHandlerRuns: false);
@@ -208,7 +215,8 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
         {
             await using var scope = _scopes.CreateAsyncScope();
             batch = await scope.ServiceProvider.GetRequiredService<OutboxStore<TContext>>().ClaimAsync(
-                _kind.Kind, free, _kind.Lease, _kind.MaxAttempts, _kind.RetryWindow, CancellationToken.None);
+                _kind.Kind, free, _kind.Lease, _kind.MaxAttempts, _kind.RetryWindow, _kind.HasGiveUpHook,
+                CancellationToken.None);
         }
         catch (Exception exception)
         {
@@ -228,20 +236,20 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
                 _metrics.Abandoned(_kind.Kind);
             }
 
+            var delivery = new OutboxDelivery(
+                message.Id, _kind.Kind, message.RecordRef, message.Attempt, message.CreatedAt, message.Deadline);
             if (message.Status == OutboxStatus.Pending)
             {
-                var delivery = new OutboxDelivery(
-                    message.Id, _kind.Kind, message.RecordRef, message.Attempt, message.CreatedAt, message.Deadline);
                 Start(new Attempt(delivery, batch.Token, now + _kind.Lease) { TraceParent = message.TraceParent });
+            }
+            else if (_kind.HasGiveUpHook)
+            {
+                // The claim held it instead of ending it: end it with the hook.
+                StartEnding(new Attempt(delivery, batch.Token, now + _kind.Lease), message.Status);
             }
             else
             {
-                if (message.Status == OutboxStatus.Expired)
-                {
-                    _metrics.Expired(_kind.Kind);
-                }
-
-                OutboxLog.EndedByClaim(_logger, message.Id, _kind.Kind, message.RecordRef, message.Status);
+                EndedByClaim(delivery, message.Status);
             }
         }
 
@@ -249,6 +257,120 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
         // idle never waits for the poll.
         _lastClaimFull = batch.Messages.Count >= free;
         _nextClaim = _lastClaimFull || _stopWhenIdle ? now : now + Backoff.Poll(_settings.PollInterval);
+    }
+
+    private void EndedByClaim(OutboxDelivery delivery, string status)
+    {
+        if (status == OutboxStatus.Expired)
+        {
+            _metrics.Expired(_kind.Kind);
+        }
+
+        OutboxLog.EndedByClaim(_logger, delivery.Id, _kind.Kind, delivery.RecordRef, status);
+    }
+
+    /// <summary>
+    /// Ends a message the claim held, on its own task. It uses a slot until its end is written, and is never
+    /// renewed: it is in the recording state from the start.
+    /// </summary>
+    private void StartEnding(Attempt held, string status)
+    {
+        lock (_gate)
+        {
+            held.State = AttemptState.Recording;
+            _running.Add(held);
+            UpdateIdle();
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                switch (await EndAsync(held, status))
+                {
+                    case true:
+                        EndedByClaim(held.Delivery, status);
+                        break;
+                    case false:
+                        OutboxLog.OutcomeRefused(_logger, held.Id, _kind.Kind, held.Delivery.Attempt);
+                        break;
+                }
+            }
+            catch (Exception exception)
+            {
+                OutboxLog.OutcomeWriteFailed(_logger, held.Id, _kind.Kind, held.Delivery.Attempt, exception);
+            }
+            finally
+            {
+                held.Dispose();
+                Release(held);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Ends a held message as <paramref name="status"/> with the kind's give-up hook: the fenced end first,
+    /// then the hook, in one transaction on a scope of its own. True when the end stands, false when it was
+    /// refused because the lease was lost (the hook never ran), and null when nothing was recorded because the
+    /// drain period ended. A hook that fails rolls back, and the message is ended without it, with its error.
+    /// </summary>
+    private async Task<bool?> EndAsync(Attempt held, string status)
+    {
+        var reason = status == OutboxStatus.Expired
+            ? OutboxGiveUpReason.DeadlinePassed
+            : held.Delivery.Attempt >= _kind.MaxAttempts
+                ? OutboxGiveUpReason.AttemptsUsedUp
+                : OutboxGiveUpReason.RetryWindowPassed;
+
+        // A scope of its own: what a failed handler left tracked in its context must not be saved here.
+        await using var scope = _scopes.CreateAsyncScope();
+        var context = scope.ServiceProvider.GetRequiredService<TContext>();
+        var store = scope.ServiceProvider.GetRequiredService<OutboxStore<TContext>>();
+        var hookToken = _drainEnded.Token;
+
+        var hookCalled = false;
+        try
+        {
+            return await context.Database.CreateExecutionStrategy().ExecuteAsync(async () =>
+            {
+                hookCalled = false;
+                await using var transaction = await context.Database.BeginTransactionAsync(CancellationToken.None);
+                if (!await store.EndAsync(held.Id, held.Token, status, error: null, CancellationToken.None))
+                {
+                    return false;
+                }
+
+                hookCalled = true;
+                var hook = (IOutboxGiveUpHandler)scope.ServiceProvider.GetRequiredService(_kind.HandlerType);
+                await hook.OnGiveUpAsync(held.Delivery, reason, hookToken);
+                await context.SaveChangesAsync(hookToken);
+                await transaction.CommitAsync(CancellationToken.None);
+                return true;
+            });
+        }
+        catch (Exception) when (!hookCalled)
+        {
+            // The end itself could not be written. The caller logs it; the claim holds the message again after its lease.
+            throw;
+        }
+        catch (Exception) when (hookToken.IsCancellationRequested)
+        {
+            // The host is stopping. Nothing is recorded: the claim holds the message again after its lease.
+            return null;
+        }
+        catch (Exception exception)
+        {
+            context.ChangeTracker.Clear();
+            var error = Error(ErrorText.GiveUpHookFailed + exception);
+            OutboxLog.GiveUpHookFailed(_logger, held.Id, _kind.Kind, held.Delivery.RecordRef, status, error);
+            if (!await store.EndAsync(held.Id, held.Token, status, error, CancellationToken.None))
+            {
+                return false;
+            }
+
+            _metrics.GiveUpHookFailed(_kind.Kind);
+            return true;
+        }
     }
 
     /// <summary>
@@ -522,11 +644,20 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
     private Task FailAsync(
         IServiceProvider services, Attempt attempt, string error, DateTimeOffset nextAttemptAt, bool timedOut = false) =>
         WriteAsync(services, attempt, async store => await store.FailAsync(
-            attempt.Id, attempt.Token, error, nextAttemptAt, _kind.MaxAttempts, _kind.RetryWindow, CancellationToken.None)
+            attempt.Id, attempt.Token, error, nextAttemptAt, _kind.MaxAttempts, _kind.RetryWindow,
+            _kind.HasGiveUpHook ? _kind.Lease : null, CancellationToken.None)
             switch
             {
                 FailOutcome.Refused => AttemptOutcome.LeaseLost,
                 FailOutcome.Parked => AttemptOutcome.Parked,
+
+                // The failure is recorded and the message is held under this attempt's token: end it with the hook.
+                FailOutcome.Held => await EndAsync(attempt, OutboxStatus.Parked) switch
+                {
+                    true => AttemptOutcome.Parked,
+                    false => AttemptOutcome.LeaseLost,
+                    null => null,
+                },
                 _ => timedOut ? AttemptOutcome.TimedOut : AttemptOutcome.Retry,
             });
 
@@ -545,7 +676,7 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
     /// Writes an outcome with no cancellation token. A refused outcome means the lease was lost. A failed
     /// write is not retried: the message comes back after its lease as an abandoned attempt.
     /// </summary>
-    private async Task WriteAsync(IServiceProvider services, Attempt attempt, Func<OutboxStore<TContext>, Task<string>> write)
+    private async Task WriteAsync(IServiceProvider services, Attempt attempt, Func<OutboxStore<TContext>, Task<string?>> write)
     {
         try
         {

@@ -1,9 +1,9 @@
-# Builds, tests and packs on every push and pull request. Publishing is publish.yml, run by hand.
+# Builds, tests and packs on pushes to main. Publishing is publish.yml, run by hand.
 name: CI
 
 on:
   push:
-  pull_request:
+    branches: [main]
 
 permissions:
   contents: read

@@ -2,10 +2,13 @@ namespace DurableOutbox.Testing;
 
 /// <summary>
 /// The contract's checks. A failure throws <see cref="InvalidOperationException"/> whose message starts with
-/// the guarantee's number and name (section 5.3), so it reads the same in any test framework.
+/// the guarantee's number and name (section 5.3), so it reads the same in any test framework. The give-up hook
+/// (section 9.5) is not a guarantee: its checks pass <see cref="GiveUpHook"/> and are named for the hook.
 /// </summary>
 internal static class Expect
 {
+    public const int GiveUpHook = 0;
+
     private static readonly string[] Guarantees =
     [
         "",
@@ -57,5 +60,7 @@ internal static class Expect
     }
 
     private static InvalidOperationException Failure(int guarantee, string what) =>
-        new($"Guarantee {guarantee} ({Guarantees[guarantee]}) does not hold: {what}.");
+        new(guarantee == GiveUpHook
+            ? $"The give-up hook does not hold: {what}."
+            : $"Guarantee {guarantee} ({Guarantees[guarantee]}) does not hold: {what}.");
 }

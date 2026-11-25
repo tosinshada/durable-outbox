@@ -67,7 +67,7 @@ dotnet ef migrations add AddOutbox
 dotnet ef database update
 ```
 
-The table is yours. The library never creates, alters or deletes from it. You choose the schema and table name; the column names are fixed.
+The table is yours. The library never creates, alters or deletes from it. You choose the schema and table name; the column names are fixed. A naming convention on your `DbContext`, such as `UseSnakeCaseNamingConvention()`, does not change them and is supported since 1.2.0.
 
 ### 2. Write a handler
 
@@ -340,7 +340,7 @@ Register the outbox with `RunWorkers = false` in your test host, then run the ha
 await serviceProvider.RunUntilIdleAsync<AppDbContext>(cancellationToken);
 ```
 
-It returns once every outcome is written. It uses the registered `TimeProvider` and does not move it, so a message whose retry is in the future is left for later.
+It returns once every outcome is written, including for a message that a handler or a give-up hook of one kind added for another kind (since 1.2.0). It uses the registered `TimeProvider` and does not move it, so a message whose retry is in the future is left for later. If a claim fails, the call throws that error instead of waiting to try again (since 1.2.0).
 
 ## What it is not
 

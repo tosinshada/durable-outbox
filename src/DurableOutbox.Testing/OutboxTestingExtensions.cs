@@ -1,5 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
+using NpgsqlTypes;
 
 namespace DurableOutbox.Testing;
 
@@ -43,15 +45,47 @@ public static class OutboxTestingExtensions
         var checkedSchema = new OutboxSchemaGate<TContext>();
         checkedSchema.Pass();
 
-        var worker = new OutboxWorker<TContext>(
-            registration.Settings,
-            services.GetRequiredService<IServiceScopeFactory>(),
-            services.GetRequiredService<TimeProvider>(),
-            OutboxServiceCollectionExtensions.Loggers(services),
-            services.GetRequiredService<OutboxMetrics>(),
-            checkedSchema,
-            stopWhenIdle: true);
+        // Each kind's loop stops on its own once nothing of its kind is due or running. A handler or a give-up
+        // hook of one kind may add a message of another kind whose loop has already stopped, so the loops are
+        // run again until a pass leaves nothing due.
+        do
+        {
+            var worker = new OutboxWorker<TContext>(
+                registration.Settings,
+                services.GetRequiredService<IServiceScopeFactory>(),
+                services.GetRequiredService<TimeProvider>(),
+                OutboxServiceCollectionExtensions.Loggers(services),
+                services.GetRequiredService<OutboxMetrics>(),
+                checkedSchema,
+                stopWhenIdle: true);
 
-        await worker.RunLoopsAsync(cancellationToken);
+            await worker.RunLoopsAsync(cancellationToken);
+        }
+        while (await AnyDueAsync<TContext>(services, registration.Settings, cancellationToken));
+    }
+
+    private static async Task<bool> AnyDueAsync<TContext>(
+        IServiceProvider services, OutboxSettings settings, CancellationToken cancellationToken)
+        where TContext : DbContext
+    {
+        await using var scope = services.CreateAsyncScope();
+        var context = scope.ServiceProvider.GetRequiredService<TContext>();
+        var table = scope.ServiceProvider.GetRequiredService<OutboxSqlProvider<TContext>>().Get(context).Table;
+
+        // The table name is the library's own delimited identifier, never a caller's text.
+#pragma warning disable EF1002
+        var due = await context.Database
+            .SqlQueryRaw<bool>(
+                $"""
+                SELECT EXISTS (
+                    SELECT 1 FROM {table}
+                     WHERE status = 'Pending' AND kind = ANY(@kinds) AND next_attempt_at <= @now) AS "Value"
+                """,
+                new NpgsqlParameter("kinds", NpgsqlDbType.Array | NpgsqlDbType.Text) { Value = settings.Kinds.Select(kind => kind.Kind).ToArray() },
+                new NpgsqlParameter("now", NpgsqlDbType.TimestampTz) { Value = services.GetRequiredService<TimeProvider>().GetUtcNow() })
+            .ToListAsync(cancellationToken);
+#pragma warning restore EF1002
+
+        return due.Single();
     }
 }

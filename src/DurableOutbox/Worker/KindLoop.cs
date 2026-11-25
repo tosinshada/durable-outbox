@@ -218,6 +218,12 @@ internal sealed class KindLoop<TContext> where TContext : DbContext
                 _kind.Kind, free, _kind.Lease, _kind.MaxAttempts, _kind.RetryWindow, _kind.HasGiveUpHook,
                 CancellationToken.None);
         }
+        catch (Exception) when (_stopWhenIdle)
+        {
+            // A run that stops when idle is a test's. Its clock may never move, so it cannot wait to try again:
+            // the failure ends the run and reaches the caller.
+            throw;
+        }
         catch (Exception exception)
         {
             _claimFailures++;

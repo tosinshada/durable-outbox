@@ -23,7 +23,7 @@ DurableOutbox is a .NET 10 library that implements the transactional outbox patt
 
 ## Code
 
-- One package, `src/DurableOutbox`. `src/DurableOutbox.Testing` is the repository's own test kit, used by the tests and not packed. Tests are in `tests/DurableOutbox.Tests`. Nothing in `src/` references `tests/`.
+- Two packages: `src/DurableOutbox` and `src/DurableOutbox.Testing`, the test kit, which services install and the repository's own tests also use. Tests are in `tests/DurableOutbox.Tests`. Nothing in `src/` references `tests/`.
 - The public API is section 9 of the design. Everything else is `internal`. A public type or member is a promise to every user of the package: don't add or change one without changing the design first.
 - Code is added with its first caller in `src/` or `tests/`. No option, overload or interface without one. Delete what loses its last caller.
 - One type per file, named after the type. Warnings are errors.

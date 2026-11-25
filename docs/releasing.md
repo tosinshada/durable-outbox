@@ -1,6 +1,6 @@
 # Releasing
 
-The `DurableOutbox` package is built, tested and packed by `.github/workflows/ci.yml` on every push to `main`. It is the only package published: `DurableOutbox.Testing` is the repository's own test kit and is not packed. Publishing to nuget.org is a separate workflow, `.github/workflows/publish.yml`, that runs only when started by hand and only after approval. It signs in with [nuget.org Trusted Publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing), so no API key is stored.
+Two packages, `DurableOutbox` and its test kit `DurableOutbox.Testing`, are built, tested and packed by `.github/workflows/ci.yml` on every push to `main`. Publishing to nuget.org is a separate workflow, `.github/workflows/publish.yml`, that runs only when started by hand and only after approval. It signs in with [nuget.org Trusted Publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing), so no API key is stored.
 
 ## One-time setup
 
@@ -20,7 +20,9 @@ The packages follow [Semantic Versioning 2.0.0](https://semver.org) (SemVer), wh
 
 A prerelease adds a label after a hyphen, such as `1.1.0-rc.1`. NuGet does not install a prerelease unless asked to, and sorts it before the stable version with the same number.
 
-`VersionPrefix` in `Directory.Build.props` holds the `MAJOR.MINOR.PATCH` part. The prerelease label is not stored there: it is given when the package is built (`dotnet pack -p:VersionSuffix=rc.1`).
+`VersionPrefix` in `Directory.Build.props` holds the `MAJOR.MINOR.PATCH` part. The prerelease label is not stored there: it is given when the package is built (`dotnet pack -p:VersionSuffix=rc.1`). Both packages always share one version, and the test kit depends on exactly that version of the library, because it uses the library's internals.
+
+The workflow pushes both packages and skips one whose version is already on nuget.org. That is how the kit's 1.1.0 is published: `DurableOutbox` 1.1.0 went out alone, so a run from the same source adds only `DurableOutbox.Testing` 1.1.0. It also means a run with a version that was not raised publishes nothing and still succeeds, so check the log of the push step.
 
 ## Each release
 

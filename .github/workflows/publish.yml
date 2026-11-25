@@ -1,4 +1,4 @@
-# Publishes the DurableOutbox package to nuget.org (DurableOutbox.Testing is not packed). Runs only when started by hand, and only after the owner approves the
+# Publishes both packages, DurableOutbox and DurableOutbox.Testing, to nuget.org. Runs only when started by hand, and only after the owner approves the
 # `nuget` environment. Signs in with nuget.org Trusted Publishing, so no API key is stored. Creates no tag.
 # The version is VersionPrefix in Directory.Build.props. A prerelease label, if given, is added after it.
 name: Publish
@@ -54,6 +54,7 @@ jobs:
         with:
           user: ${{ vars.NUGET_USER }}
 
-      # Pushing a .nupkg also pushes the .snupkg beside it.
+      # Pushing a .nupkg also pushes the .snupkg beside it. A package whose version is already on nuget.org is
+      # skipped, so a run can add the one package of a version that is missing.
       - name: Push
-        run: dotnet nuget push "artifacts/*.nupkg" --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json
+        run: dotnet nuget push "artifacts/*.nupkg" --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate

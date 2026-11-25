@@ -30,19 +30,14 @@ The transactional outbox pattern closes that gap. The intent to send is stored a
 - **Operator API** to list, retry and cancel parked or rejected messages, with each attempt's error.
 - **OpenTelemetry** metrics and traces, with the trace carried from the request that wrote the message to the handler that delivers it.
 - **Health check** that reports a backlog, and a **start-up check** that the table matches what the library expects.
-- **Testing kit** that runs the guarantees against your own schema, and runs your handlers on demand in integration tests.
 
 ## Install
 
 ```shell
 dotnet add package DurableOutbox
-dotnet add package DurableOutbox.Testing   # in your test project, optional
 ```
 
-| Package | What it contains |
-| :--- | :--- |
-| `DurableOutbox` | The writer, the workers, the EF Core table mapping, the operator API, telemetry and the health check. |
-| `DurableOutbox.Testing` | The guarantee checks to run against your own schema, and `RunUntilIdleAsync` for integration tests. Works with any test framework. |
+The package contains the writer, the workers, the EF Core table mapping, the operator API, telemetry and the health check.
 
 Requires .NET 10, EF Core 10 with `Npgsql.EntityFrameworkCore.PostgreSQL`, and PostgreSQL 14 or later.
 
@@ -173,7 +168,7 @@ Each attempt runs in its own dependency-injection scope with a fresh handler. Th
 5. **Never dropped.** A message that cannot be delivered is parked with the error from each attempt. The library deletes nothing.
 6. **No ordering promise.** Messages are claimed by priority, then due time, but any two can be handled in either order or at the same time. A handler that cares must check the record's current state.
 
-Each guarantee is tested against a real PostgreSQL database, and `DurableOutbox.Testing` lets you run the same checks against yours.
+Each guarantee is tested against a real PostgreSQL database.
 
 ## Configuration
 
@@ -273,35 +268,6 @@ When the host starts, the library compares the table's columns and indexes with 
 - **Slow work.** Kinds do not hold each other up, but messages of one kind share its slots. Give work that must not wait its own kind.
 - **Repeated sends.** If the database is unreachable for longer than a lease, another worker can take a message while a handler that ignores its token is still sending. At-least-once delivery already allows this; make receivers idempotent.
 - **Upgrades.** When a release changes the table's indexes, add one migration. The start-up check tells you what is missing.
-
-## Testing your service
-
-### Check the guarantees against your schema
-
-`OutboxContract<TContext>` runs the guarantees against your own `DbContext`, from any test framework. Point it at a database used only for tests, with your migrations applied; it leaves the rows it writes.
-
-```csharp
-var contract = new OutboxContract<AppDbContext>(services =>
-    services.AddDbContext<AppDbContext>(options => options.UseNpgsql(testConnectionString)));
-
-await contract.WrittenWithTheChangeAsync();
-await contract.AtLeastOnceAsync();
-await contract.OneOwnerAtATimeAsync();
-await contract.CrashIsAnAttemptAsync();
-await contract.NeverDroppedAsync();
-```
-
-Each check uses its own fake clock and its own message kinds, so it never waits on real time and never touches your messages. A check that fails throws `InvalidOperationException` naming the guarantee.
-
-### Run your handlers in an integration test
-
-Register the outbox with `RunWorkers = false` in your test host, then run the handlers until nothing is due:
-
-```csharp
-await serviceProvider.RunUntilIdleAsync<AppDbContext>(cancellationToken);
-```
-
-It returns once every outcome is written. It uses the registered `TimeProvider` and does not move it, so a message whose retry is in the future is left for later.
 
 ## What it is not
 

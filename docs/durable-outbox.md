@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Version 1.0.0 of both packages is published on nuget.org, and later packs are checked against it for breaking changes. Section 9.15 has the detail. |
+| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Version 1.0.0 of `DurableOutbox` and of the test kit, `DurableOutbox.Testing`, is published on nuget.org, and later packs of `DurableOutbox` are checked against it for breaking changes. After 1.0.0 only `DurableOutbox` is published (section 6, decision 12). Section 9.15 has the detail. |
 | Date | 2026-11-25 |
 | Next step | None set. Later work (section 5.5) goes through OpenSpec and is released by the steps in `docs/releasing.md`. |
 
@@ -51,7 +51,7 @@ Sources are listed in section 10.
 
 ### 5.1 What it is
 
-A NuGet package named `DurableOutbox` (with a companion test kit, `DurableOutbox.Testing`), public on nuget.org under the MIT licence, for .NET 10 services that use PostgreSQL through EF Core and Npgsql. A service:
+A NuGet package named `DurableOutbox`, public on nuget.org under the MIT licence, for .NET 10 services that use PostgreSQL through EF Core and Npgsql. A service:
 
 1. Registers the library and applies its EF Core configuration to its own `DbContext`.
 2. Creates the table through its own migrations.
@@ -135,6 +135,7 @@ These are the contract. Each one is proved by a test against real PostgreSQL.
 | 9 | Table ownership | The service, through its own migrations. The library supplies the EF Core configuration. |
 | 10 | Package name | `DurableOutbox`. |
 | 11 | Distribution and licence | Public on nuget.org, MIT. |
+| 12 | Test kit distribution | `DurableOutbox.Testing` was published with version 1.0.0 only. Later versions publish `DurableOutbox` alone; the kit stays in the repository, where the library's own tests run the guarantees through it (9.12). |
 
 ## 7. How we know it worked
 
@@ -153,10 +154,10 @@ Code and SQL here show the intended shape; names can still change during impleme
 
 ### 9.1 Packages
 
-| Package | Contents | Depends on |
+| Project | Contents | Depends on |
 | :--- | :--- | :--- |
-| `DurableOutbox` | Writer, workers, EF Core configuration, operator API, telemetry, health check | `Npgsql.EntityFrameworkCore.PostgreSQL`, `Microsoft.Extensions.Hosting.Abstractions`, `Microsoft.Extensions.Diagnostics.HealthChecks` |
-| `DurableOutbox.Testing` | The contract tests and a drain helper for a service's own tests | `DurableOutbox` (the exact same version, because the kit uses its internals), `Microsoft.Extensions.TimeProvider.Testing` (the clock the contract tests move) |
+| `DurableOutbox` (published) | Writer, workers, EF Core configuration, operator API, telemetry, health check | `Npgsql.EntityFrameworkCore.PostgreSQL`, `Microsoft.Extensions.Hosting.Abstractions`, `Microsoft.Extensions.Diagnostics.HealthChecks` |
+| `DurableOutbox.Testing` (not published after 1.0.0) | The contract tests and a drain helper, used by the library's own tests | `DurableOutbox` (a project reference, because the kit uses its internals), `Microsoft.Extensions.TimeProvider.Testing` (the clock the contract tests move) |
 
 Both target `net10.0` only. PostgreSQL 14 or later.
 
@@ -561,7 +562,7 @@ The library's own tests run against PostgreSQL in Testcontainers, with a fake `T
 | Slow work | An attempt past its timeout is cancelled, recorded as a retry and its slot freed, including when the handler ignores the token. A kind with every slot held does not delay another kind. |
 | Other | Priority order, deadline expiry, backoff timing, `Done(record)` committing with the completion and rolling back when the lease is lost, drain on shutdown, recovery after the database restarts. |
 
-`DurableOutbox.Testing` publishes the guarantee tests as methods a service calls against its own `DbContext` and schema, with no dependency on a test framework:
+`DurableOutbox.Testing` holds the guarantee tests as methods called against a `DbContext` and schema, with no dependency on a test framework. Version 1.0.0 of it was published for services to run against their own schema; later versions are not published (section 6, decision 12), and the kit is used by the library's own tests:
 
 ```csharp
 namespace DurableOutbox.Testing;
@@ -620,7 +621,7 @@ It runs the handlers registered for `TContext`, with their options, until no mes
 | 10 | The operator statements write the status into the SQL text and accept only `Parked` and `Rejected` for lists. | A status passed as a parameter cannot be matched to a partial index, and the other statuses have no index to page by finish time on. |
 | 11 | The gauges are sampled every 15 seconds by one statement and read from memory. | A query inside the gauge callback would let the metrics collector decide the database load, and the health check would query on every probe. |
 | 12 | The start-up check gates the workers and retries an unreachable database instead of failing the start. | A table that does not match is a deployment error and must stop the host; a database that is briefly down is not, and the loop already survives it. |
-| 13 | The test kit depends on the exact same version of the library and on `Microsoft.Extensions.TimeProvider.Testing`. | It runs the library's own claim and worker internals against the service's schema, and moves a fake clock as the library's tests do. |
+| 13 | The test kit depends on the exact same version of the library and on `Microsoft.Extensions.TimeProvider.Testing`. Since the kit is no longer packed (section 6, decision 12), the exact version is a project reference. | It runs the library's own claim and worker internals against the service's schema, and moves a fake clock as the library's tests do. |
 
 ### 9.15 What is verified
 
@@ -646,7 +647,7 @@ Built and tested against PostgreSQL 17 (change `add-operations-and-release`):
 - Telemetry (9.11): the counters and the duration by outcome, including `abandoned` and `expired`; the gauges from one sample, with a message under a live claim not counted as due; the consumer activity, current inside the handler, with the writer's activity as its parent; and the health check, `Degraded` past its limit and when a sample fails.
 - The start-up check (9.11): a missing column or index is reported by name, an extra column of the service's is allowed, and nothing is claimed; a database unreachable at start-up delays the check without stopping it.
 - The test kit (9.12): guarantees 1 to 5 run as the kit's methods against `svc.outbox` and against a second context mapping `contract.messages`, beside a message of the service's own that they leave unchanged. With the claim's `FOR UPDATE SKIP LOCKED` removed, and separately with `lease_token = @token` removed from the completion, guarantee 3 fails for both contexts. `RunUntilIdleAsync` runs handlers with `RunWorkers` false and returns with a retried message left for later.
-- Both packages pack with the MIT licence, the readme and symbols, and the kit depends on exactly the same version of the library.
+- Both packages packed for 1.0.0 with the MIT licence, the readme and symbols, and the kit depended on exactly the same version of the library. From then on `dotnet pack` produces `DurableOutbox` alone.
 
 Not yet verified: nothing has been run on PostgreSQL 14 to 16, and the GitHub Actions workflows have not run, because the repository has not been pushed. Their steps were run locally.
 

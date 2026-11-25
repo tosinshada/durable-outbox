@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Version 1.0.0 of `DurableOutbox` and of the test kit, `DurableOutbox.Testing`, is published on nuget.org, and later packs of both are checked against it for breaking changes. Version 1.1.0 adds the give-up hook (9.5), built and tested the same way; `DurableOutbox` 1.1.0 is published, and the kit's 1.1.0 is packed from the same source and waits to be published (section 6, decision 12). Section 9.15 has the detail. |
+| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Version 1.0.0 of `DurableOutbox` and of the test kit, `DurableOutbox.Testing`, is published on nuget.org, and later packs of both are checked against it for breaking changes. Version 1.1.0 adds the give-up hook (9.5), built and tested the same way; `DurableOutbox` 1.1.0 is published, and the kit's 1.1.0 is packed from the same source and waits to be published (section 6, decision 12). Version 1.2.0 makes the library work under an EF Core naming convention (9.3) and makes `RunUntilIdleAsync` stop on a failed claim and handle messages that one kind adds for another (9.12); it is built and tested, and not yet published. Section 9.15 has the detail. |
 | Date | 2026-11-25 |
 | Next step | None set. Later work (section 5.5) goes through OpenSpec and is released by the steps in `docs/releasing.md`. |
 
@@ -173,7 +173,7 @@ This gives three properties with no extra machinery:
 
 ### 9.3 Table
 
-The service creates this through its own migrations, from the EF Core configuration the library supplies. Schema and table name are the service's choice. Column names are fixed by the configuration, so the library's SQL does not depend on the service's naming convention.
+The service creates this through its own migrations, from the EF Core configuration the library supplies. Schema and table name are the service's choice. Column names are fixed by the configuration, so the library's SQL does not depend on the service's naming convention. The same holds for what the library reads back: a naming convention added to the service's `DbContext` (for example `UseSnakeCaseNamingConvention()` from the EFCore.NamingConventions package) also applies to the internal types the claim, the gauges, the operator list and the start-up check read their rows into, so every property of those types names its result column itself, which a convention does not override (since 1.2.0).
 
 | Column | Type | Notes |
 | :--- | :--- | :--- |
@@ -647,7 +647,7 @@ public static Task RunUntilIdleAsync<TContext>(this IServiceProvider services, C
     where TContext : DbContext;
 ```
 
-It runs the handlers registered for `TContext`, with their options, until no message of a registered kind is due and no attempt is running, then returns with every outcome written. It works with `RunWorkers` set to false, which is how a test host usually registers the outbox: `AddDurableOutbox` registers the handlers whatever `RunWorkers` says. It uses the service's `TimeProvider` and does not move it, so a message whose next attempt is in the future is left for later. It throws `InvalidOperationException` when no handler is registered for `TContext`, or when the start-up check fails.
+It runs the handlers registered for `TContext`, with their options, until no message of a registered kind is due and no attempt is running, then returns with every outcome written. That includes a message that a handler or a give-up hook of one kind adds for another kind: each kind's loop stops by itself, so the loops are run again until a pass leaves no pending message of a registered kind due (since 1.2.0). It works with `RunWorkers` set to false, which is how a test host usually registers the outbox: `AddDurableOutbox` registers the handlers whatever `RunWorkers` says. It uses the service's `TimeProvider` and does not move it, so a message whose next attempt is in the future is left for later. It throws `InvalidOperationException` when no handler is registered for `TContext`, or when the start-up check fails. A claim that fails ends the run and throws the claim's error (since 1.2.0): the hosted worker waits and claims again, but here the clock is the test's and may never move, so the wait would not end. The hosted worker is unchanged.
 
 ### 9.13 Operating notes and known limits
 
@@ -688,6 +688,8 @@ It runs the handlers registered for `TContext`, with their options, until no mes
 | 16 | A held message uses one of its kind's slots until its end is written. | A full claim is followed by another at once, so hooks with no slot could pile up without limit and use the service's connection pool. |
 | 17 | `Reject` takes no record to commit with the rejection. | The handler decides to reject while it runs, so it can write its record before it returns, and a repeat of that is harmless. No caller needs the overload. It can be added later without breaking anything. |
 | 18 | The give-up hook is an interface on the kind's handler class, not an option. | The hook needs the scope's `DbContext`, which a handler class already gets by injection, and it keeps a kind's logic in one class. |
+| 19 | The types the library reads query results into name every result column with `[Column]`. | A naming convention on the service's `DbContext` applies to these types too and would look for other names, so no message would ever be claimed. An attribute outranks a convention. |
+| 20 | In `RunUntilIdleAsync` a failed claim ends the run with its error, and the loops are run again until nothing is due. | A test's clock may never move, so the worker's wait before the next claim would hang the test and hide the error. Kinds stop one by one, so work one kind adds for another is only found by another pass. |
 
 ### 9.15 What is verified
 
@@ -720,6 +722,12 @@ Built and tested against PostgreSQL 17 (change `add-give-up-hook`, version 1.1.0
 - The give-up hook (9.5), by the test kit's `GiveUpHookAsync` against `svc.outbox` and `contract.messages`: a message parked by a failed last attempt, one parked at the claim after attempts that never reported, and one expired at the claim each store the hook's write with the status and get the right reason; a hook that throws leaves the message parked with the hook's error, without the write, and not claimable a day later. With the holding claim replaced by the plain one, the method fails for the message parked at the claim.
 - A held message cancelled by an operator before its end is not ended; the hook does not run when the last attempt's lease was taken over; the reason is `RetryWindowPassed` when the window has passed with attempts left, and changes the hook left tracked are saved; with two slots and five expired messages no more than two hooks run at once; a hook that throws is counted, logged, and its attempt counted `parked`.
 - `dotnet pack` of 1.1.0 passes package validation against the 1.0.0 baseline, for both packages. The kit's 1.1.0 package depends on `DurableOutbox` `[1.1.0]`.
+
+Built and tested against PostgreSQL 17 (change `fix-naming-convention-and-idle-run`, version 1.2.0):
+
+- A naming convention (9.3): guarantees 1 to 5 and the give-up hook run as the kit's methods against a third context registered with `UseSnakeCaseNamingConvention()`, and the start-up check, the gauges and the operator list read their rows under it. With the `[Column]` attributes removed, guarantees 2 to 5, the give-up hook and that test fail.
+- `RunUntilIdleAsync` (9.12): with every claim made to fail by a trigger, on a table that passes the start-up check, the call throws the claim's error and the message is left pending with no attempt; with the old loop the test never ends. Two kinds whose give-up hooks each add a message for the other are run to the end of a chain of six messages in one call; with a single pass the test fails.
+- `dotnet pack` of 1.2.0 passes package validation against the 1.0.0 baseline, for both packages. The kit's 1.2.0 package depends on `DurableOutbox` `[1.2.0]`.
 
 Not yet verified: nothing has been run on PostgreSQL 14 to 16, and the GitHub Actions workflows have not run, because the repository has not been pushed. Their steps were run locally.
 

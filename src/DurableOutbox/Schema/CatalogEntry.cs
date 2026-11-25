@@ -1,3 +1,5 @@
+using System.ComponentModel.DataAnnotations.Schema;
+
 namespace DurableOutbox;
 
 /// <summary>
@@ -7,8 +9,12 @@ namespace DurableOutbox;
 /// </summary>
 internal sealed class CatalogEntry
 {
+    [Column("Kind")]
     public string Kind { get; init; } = null!;
+    [Column("Name")]
     public string Name { get; init; } = null!;
+    [Column("Detail")]
     public string Detail { get; init; } = null!;
+    [Column("Flag")]
     public bool Flag { get; init; }
 }

@@ -87,6 +87,72 @@ public sealed class OperatorTests(PostgresFixture postgres) : OutboxTestBase(pos
         Assert.Equal(OutboxStatus.Completed, (await RowAsync("completed")).Status);
     }
 
+    [Fact]
+    public async Task A_message_is_found_by_its_id_in_every_status_and_an_unknown_id_finds_nothing()
+    {
+        await AddAsync(new OutboxMessage(Kind, "completed"));
+        var (completed, completedToken) = await ClaimOneAsync();
+        Assert.True(await CompleteAsync(completed.Id, completedToken));
+
+        await AddAsync(new OutboxMessage(Kind, "rejected"));
+        var (rejected, rejectedToken) = await ClaimOneAsync();
+        Assert.True(await RejectAsync(rejected.Id, rejectedToken, "unknown customer"));
+
+        await AddAsync(new OutboxMessage(Kind, "parked"));
+        await ParkAllDueAsync(Kind);
+
+        await AddAsync(new OutboxMessage(Kind, "expired") { Deadline = Time.GetUtcNow() + TimeSpan.FromMinutes(1) });
+        Time.Advance(TimeSpan.FromMinutes(2));
+        Assert.Equal(OutboxStatus.Expired, Assert.Single((await ClaimAsync()).Messages).Status);
+
+        await AddAsync(new OutboxMessage(Kind, "cancelled"));
+        var cancelled = await RowAsync("cancelled");
+        Assert.True(await AdminAsync(admin => admin.CancelAsync(cancelled.Id, Ct)));
+
+        await AddAsync(new OutboxMessage(Kind, "pending"));
+
+        var found = new Dictionary<string, OutboxMessageStatus>();
+        foreach (var row in await RowsAsync())
+        {
+            var message = await AdminAsync(admin => admin.FindAsync(row.Id, Ct));
+            Assert.NotNull(message);
+            Assert.Equal(row.Id, message.Id);
+            found.Add(message.RecordRef, message.Status);
+        }
+
+        Assert.Equal(
+            new Dictionary<string, OutboxMessageStatus>
+            {
+                ["pending"] = OutboxMessageStatus.Pending,
+                ["completed"] = OutboxMessageStatus.Completed,
+                ["rejected"] = OutboxMessageStatus.Rejected,
+                ["parked"] = OutboxMessageStatus.Parked,
+                ["expired"] = OutboxMessageStatus.Expired,
+                ["cancelled"] = OutboxMessageStatus.Cancelled,
+            },
+            found);
+
+        Assert.Null(await AdminAsync(admin => admin.FindAsync(Guid.NewGuid(), Ct)));
+    }
+
+    [Fact]
+    public async Task A_message_found_by_its_id_is_the_entry_the_list_returns_for_it()
+    {
+        await AddAsync(new OutboxMessage(Kind, "order-1") { UniqueKey = "order-1", Priority = 2 });
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            var (message, token) = await ClaimOneAsync(maxAttempts: 3);
+            Time.Advance(TimeSpan.FromSeconds(1));
+            await FailAsync(message.Id, token, $"failure {attempt}", maxAttempts: 3);
+        }
+
+        var listed = Assert.Single(await ListAsync(new OutboxQuery(OutboxMessageStatus.Parked)));
+        Assert.Equal(["failure 1", "failure 2", "failure 3"], listed.Errors.Select(error => error.Error));
+
+        var found = await AdminAsync(admin => admin.FindAsync(listed.Id, Ct));
+        Assert.Equivalent(listed, found, strict: true);
+    }
+
     private const string OtherKind = "invoice.file";
 
     /// <summary>Claims every due message of a kind and fails each with no attempts left, so all park in one instant.</summary>

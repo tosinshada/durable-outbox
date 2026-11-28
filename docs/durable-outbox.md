@@ -2,8 +2,8 @@
 
 | | |
 | :--- | :--- |
-| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Version 1.0.0 of `DurableOutbox` and of the test kit, `DurableOutbox.Testing`, is published on nuget.org, and later packs of both are checked against it for breaking changes. Version 1.1.0 adds the give-up hook (9.5), built and tested the same way; `DurableOutbox` 1.1.0 is published, and the kit's 1.1.0 is packed from the same source and waits to be published (section 6, decision 12). Version 1.2.0 makes the library work under an EF Core naming convention (9.3) and makes `RunUntilIdleAsync` stop on a failed claim and handle messages that one kind adds for another (9.12); it is built and tested, and not yet published. Section 9.15 has the detail. |
-| Date | 2026-11-25 |
+| Status | Part 1 (feature proposal, sections 1 to 8) and Part 2 (technical design, section 9) are agreed. Version 1 is built and tested against PostgreSQL 17: the table, the writer, the claim, the fenced outcomes, the handlers, the workers, the operator API, telemetry, the health check, the start-up check and the test kit. Version 1.0.0 of `DurableOutbox` and of the test kit, `DurableOutbox.Testing`, is published on nuget.org; packs up to 1.2.0 were checked against it for breaking changes, and from 1.3.0 nothing checks them automatically (section 9.14, decision 22). Version 1.1.0 adds the give-up hook (9.5), built and tested the same way; `DurableOutbox` 1.1.0 is published, and the kit's 1.1.0 is packed from the same source and waits to be published (section 6, decision 12). Version 1.2.0 makes the library work under an EF Core naming convention (9.3) and makes `RunUntilIdleAsync` stop on a failed claim and handle messages that one kind adds for another (9.12); it is built and tested, and not yet published. Version 1.3.0 adds `IOutboxAdmin.FindAsync`, a read of one message by its ID in any status (9.10, section 9.14 decision 21); it is built and tested, and not yet published. Section 9.15 has the detail. |
+| Date | 2026-11-28 |
 | Next step | None set. Later work (section 5.5) goes through OpenSpec and is released by the steps in `docs/releasing.md`. |
 
 ## 1. Summary
@@ -173,7 +173,7 @@ This gives three properties with no extra machinery:
 
 ### 9.3 Table
 
-The service creates this through its own migrations, from the EF Core configuration the library supplies. Schema and table name are the service's choice. Column names are fixed by the configuration, so the library's SQL does not depend on the service's naming convention. The same holds for what the library reads back: a naming convention added to the service's `DbContext` (for example `UseSnakeCaseNamingConvention()` from the EFCore.NamingConventions package) also applies to the internal types the claim, the gauges, the operator list and the start-up check read their rows into, so every property of those types names its result column itself, which a convention does not override (since 1.2.0).
+The service creates this through its own migrations, from the EF Core configuration the library supplies. Schema and table name are the service's choice. Column names are fixed by the configuration, so the library's SQL does not depend on the service's naming convention. The same holds for what the library reads back: a naming convention added to the service's `DbContext` (for example `UseSnakeCaseNamingConvention()` from the EFCore.NamingConventions package) also applies to the internal types the claim, the gauges, the operator list and read, and the start-up check read their rows into, so every property of those types names its result column itself, which a convention does not override (since 1.2.0).
 
 | Column | Type | Notes |
 | :--- | :--- | :--- |
@@ -501,6 +501,7 @@ All times come from `TimeProvider`. A lease must be much longer than the clock d
 public interface IOutboxAdmin
 {
     Task<IReadOnlyList<OutboxMessageInfo>> ListAsync(OutboxQuery query, CancellationToken cancellationToken);
+    Task<OutboxMessageInfo?> FindAsync(Guid id, CancellationToken cancellationToken);       // any status; null when no message has the ID (since 1.3.0)
     Task<bool> RetryAsync(Guid id, CancellationToken cancellationToken);   // Parked or Rejected → Pending, attempts reset, errors kept
     Task<bool> CancelAsync(Guid id, CancellationToken cancellationToken);  // Pending or Parked → Cancelled
 }
@@ -538,6 +539,17 @@ SELECT id, kind, record_ref, unique_key, priority, status, attempts,
 ```
 
 With a kind, the operator index is read in order. Without one, every parked (or rejected) entry is read and sorted, which is cheap while that set is small.
+
+`FindAsync` reads one message by its ID, in any status from `Pending` to `Cancelled`, and returns null when no message has that ID (since 1.3.0). It selects the same columns as the list and fills `OutboxMessageInfo` the same way, error history included. It is served by the primary key, takes no lock, opens no transaction and changes nothing; inside a transaction the service has open on the same `DbContext`, it reads what that transaction sees:
+
+```sql
+SELECT id, kind, record_ref, unique_key, priority, status, attempts,
+       created_at, deadline_at, finished_at, last_error, errors
+  FROM app.outbox_messages
+ WHERE id = @id;
+```
+
+It exists so that a service can say why a retry or a cancel returned false: no such message, or a message in a status the operation does not apply to. The read and the operation are separate statements, so the message can change between them, by the worker or by another operator. The boolean the operation returns is the answer to whether it acted; the read only explains a false.
 
 Retry and cancel are one statement each, by primary key. Each returns whether the message was in a status it applies to:
 
@@ -690,6 +702,8 @@ It runs the handlers registered for `TContext`, with their options, until no mes
 | 18 | The give-up hook is an interface on the kind's handler class, not an option. | The hook needs the scope's `DbContext`, which a handler class already gets by injection, and it keeps a kind's logic in one class. |
 | 19 | The types the library reads query results into name every result column with `[Column]`. | A naming convention on the service's `DbContext` applies to these types too and would look for other names, so no message would ever be claimed. An attribute outranks a convention. |
 | 20 | In `RunUntilIdleAsync` a failed claim ends the run with its error, and the loops are run again until nothing is due. | A test's clock may never move, so the worker's wait before the next claim would hang the test and hide the error. Kinds stop one by one, so work one kind adds for another is only found by another pass. |
+| 21 | `FindAsync` is added to `IOutboxAdmin` in a minor version (1.3.0). Retry and cancel keep their boolean results. | The library registers and implements `IOutboxAdmin`; services resolve it and are not meant to implement it, so the new member breaks no intended use. A read by ID lets a service tell "no such message" from "wrong status" without changing the result of an existing call. A service that wrote its own implementation, such as a hand-written fake, has to add the member. |
+| 22 | Package validation is off from 1.3.0: `dotnet pack` no longer compares a release's public API with an earlier one on nuget.org, and there is no suppression file. | The owner's choice. Breaking changes are found by comparing the public API with the last release and with section 9 before each release (`docs/releasing.md`). |
 
 ### 9.15 What is verified
 
@@ -728,6 +742,11 @@ Built and tested against PostgreSQL 17 (change `fix-naming-convention-and-idle-r
 - A naming convention (9.3): guarantees 1 to 5 and the give-up hook run as the kit's methods against a third context registered with `UseSnakeCaseNamingConvention()`, and the start-up check, the gauges and the operator list read their rows under it. With the `[Column]` attributes removed, guarantees 2 to 5, the give-up hook and that test fail.
 - `RunUntilIdleAsync` (9.12): with every claim made to fail by a trigger, on a table that passes the start-up check, the call throws the claim's error and the message is left pending with no attempt; with the old loop the test never ends. Two kinds whose give-up hooks each add a message for the other are run to the end of a chain of six messages in one call; with a single pass the test fails.
 - `dotnet pack` of 1.2.0 passes package validation against the 1.0.0 baseline, for both packages. The kit's 1.2.0 package depends on `DurableOutbox` `[1.2.0]`.
+
+Built and tested against PostgreSQL 17 (change `add-operator-find`, version 1.3.0):
+
+- `FindAsync` (9.10): one message in each of the six statuses is returned with its status, an unknown ID returns null, and a parked message with three errors is returned equal to its entry in the list. With the read limited to `Parked` and `Rejected`, the first test fails.
+- `dotnet pack` produces both 1.3.0 packages, with no package validation (9.14, decision 22). The kit's 1.3.0 package depends on `DurableOutbox` `[1.3.0]`.
 
 Not yet verified: nothing has been run on PostgreSQL 14 to 16, and the GitHub Actions workflows have not run, because the repository has not been pushed. Their steps were run locally.
 

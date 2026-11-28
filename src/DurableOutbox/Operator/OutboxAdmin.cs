@@ -54,6 +54,17 @@ internal sealed class OutboxAdmin<TContext>(TContext context, OutboxSqlProvider<
         return [.. rows.Select(ToInfo)];
     }
 
+    public async Task<OutboxMessageInfo?> FindAsync(Guid id, CancellationToken cancellationToken)
+    {
+        // Read as a list rather than with FirstOrDefaultAsync, which would wrap the statement in a subquery.
+        // The primary key returns at most one row.
+        var rows = await context.Database
+            .SqlQueryRaw<OutboxListRow>(sql.Get(context).Find, Id(id))
+            .ToListAsync(cancellationToken);
+
+        return rows is [var row] ? ToInfo(row) : null;
+    }
+
     public async Task<bool> RetryAsync(Guid id, CancellationToken cancellationToken) =>
         await context.Database.ExecuteSqlRawAsync(sql.Get(context).Retry, [Id(id), Now()], cancellationToken) == 1;
 

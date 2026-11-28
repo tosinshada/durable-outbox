@@ -159,6 +159,12 @@ internal sealed class OutboxSql
               FROM {table} WHERE status = 'Parked' GROUP BY kind
             """;
 
+        Find = $"""
+            SELECT {InfoColumns}
+              FROM {table}
+             WHERE id = @id
+            """;
+
         Table = table;
     }
 
@@ -213,15 +219,26 @@ internal sealed class OutboxSql
     /// pass only <see cref="OutboxStatus.Parked"/> or <see cref="OutboxStatus.Rejected"/>.
     /// </summary>
     public string List(string status, bool byKind, bool afterEntry) => $"""
-        SELECT id AS "Id", kind AS "Kind", record_ref AS "RecordRef", unique_key AS "UniqueKey",
-               priority AS "Priority", status AS "Status", attempts AS "Attempts", created_at AS "CreatedAt",
-               deadline_at AS "Deadline", finished_at AS "FinishedAt", last_error AS "LastError", errors AS "Errors"
+        SELECT {InfoColumns}
           FROM {Table}
          WHERE status = '{status}'
                {(byKind ? "AND kind = @kind" : "")}
                {(afterEntry ? "AND (finished_at, id) < (@after_finished_at, @after_id)" : "")}
          ORDER BY finished_at DESC, id DESC
          LIMIT @limit
+        """;
+
+    /// <summary>The operator read of one message by primary key, in any status, with the list's columns.</summary>
+    public string Find { get; }
+
+    /// <summary>
+    /// The columns of an operator entry, named as <see cref="OutboxListRow"/> reads them. The list and the
+    /// read both select these, so an entry is the same whichever returns it.
+    /// </summary>
+    private const string InfoColumns = """
+        id AS "Id", kind AS "Kind", record_ref AS "RecordRef", unique_key AS "UniqueKey",
+               priority AS "Priority", status AS "Status", attempts AS "Attempts", created_at AS "CreatedAt",
+               deadline_at AS "Deadline", finished_at AS "FinishedAt", last_error AS "LastError", errors AS "Errors"
         """;
 
     private static string End(string table, string status) => $"""

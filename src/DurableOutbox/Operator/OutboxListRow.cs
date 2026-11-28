@@ -2,7 +2,7 @@ using System.ComponentModel.DataAnnotations.Schema;
 
 namespace DurableOutbox;
 
-/// <summary>One row of the operator list, as the statement returns it.</summary>
+/// <summary>One row of the operator list, or the row of the operator read by ID, as the statement returns it.</summary>
 internal sealed class OutboxListRow
 {
     [Column("Id")]

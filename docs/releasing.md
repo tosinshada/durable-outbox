@@ -29,12 +29,9 @@ The workflow pushes both packages and skips one whose version is already on nuge
 1. Set `VersionPrefix` in `Directory.Build.props` to the next version, by the rules above, and merge.
 2. Start the publish workflow by hand. For a prerelease, enter its label (such as `rc.1`) in the `prerelease` box; leave the box empty for a stable release. The workflow rejects a label that is not valid SemVer.
 3. Approve the `nuget` environment when asked.
-4. After a stable release, set `PackageValidationBaselineVersion` in `Directory.Build.props` to it (see below).
 
 The workflow creates no tag.
 
 ## Checking for breaking changes
 
-`EnablePackageValidation` is on in `Directory.Build.props`, with `PackageValidationBaselineVersion` set to the last stable version on nuget.org (now `1.0.0`). `dotnet pack` downloads that version and fails if the public API has lost or changed anything it had, so a breaking change cannot ship by mistake.
-
-When a break is intended, raise the major version and tell package validation the break is expected, either by suppressing the specific errors or by leaving out the baseline for that one release. After each stable release, move `PackageValidationBaselineVersion` to that release, so the next one is checked against it. A prerelease is never the baseline.
+Nothing checks the public API automatically: package validation is off since 1.3.0 (design 9.14, decision 22), so `dotnet pack` does not compare a release with the last one on nuget.org. Before each release, compare the public types and members in `src/` with the last release (`git diff` against its commit) and with section 9 of the design, and choose the version by the rules above. A member added to a public interface breaks a type that implements it; for an interface only the library implements, such as `IOutboxAdmin`, that is not a break for services, so the release stays minor (decision 21).

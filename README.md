@@ -268,6 +268,20 @@ await admin.CancelAsync(parked[1].Id, cancellationToken);   // never attempted a
 
 `ListAsync` returns parked or rejected messages, most recently finished first, with up to the last 20 errors each. Pass the last entry of a page as `After` to get the next page.
 
+`RetryAsync` and `CancelAsync` return `false` both when there is no such message and when the message is in a status they do not apply to. `FindAsync` (since 1.3.0) reads one message by its ID, in any status, with the same fields and errors as a list entry, or returns `null` when no message has that ID. Use it to tell the two cases apart, for example to answer `404` or `409` from your own admin API:
+
+```csharp
+if (!await admin.RetryAsync(id, cancellationToken))
+{
+    var message = await admin.FindAsync(id, cancellationToken);
+    return message is null
+        ? Results.NotFound()
+        : Results.Conflict($"The message is {message.Status}.");
+}
+```
+
+`FindAsync` is a plain read: it takes no lock and changes nothing. The worker or another operator can change the message between the read and a retry or cancel, so the boolean those two return is the answer to whether they acted. `FindAsync` only explains why they did not.
+
 ### Metrics and traces
 
 ```csharp
